@@ -1,6 +1,6 @@
 version 1.0
 
-## Fix invalid read-group PL tag in a CRAM.
+## Fix invalid read-group PL tag in a BAM or CRAM.
 ##
 ## Picard ValidateSamFile rejects PL:"NovaSeq X" because PL must come from the
 ## SAM spec controlled vocabulary (ILLUMINA, PACBIO, ONT, ...). "NovaSeq X" is
@@ -8,14 +8,18 @@ version 1.0
 ## @RG so that:
 ##   PL:NovaSeq X  ->  PL:ILLUMINA   (and adds PM:NovaSeq X if no PM present)
 ## It is a header-only rewrite (samtools reheader) -- no realignment, no
-## reference required, runs in seconds-to-minutes depending on CRAM size.
+## reference required, runs in seconds-to-minutes depending on file size.
+##
+## Input format (BAM vs CRAM) is detected by content (magic bytes), not the
+## filename, so a mislabeled extension is handled correctly. The output and its
+## index are written with the matching extension (.bam/.bai or .cram/.crai).
 ##
 ## Run once per affected sample (3 of them); sample_name identifies the sample
 ## and names the outputs.
 
 workflow FixReadGroupPlatform {
   input {
-    File   input_cram
+    File   input_reads              # BAM or CRAM (format auto-detected)
     String sample_name              # SM, used for output naming / traceability
     String bad_pl    = "NovaSeq X"  # the offending PL value to replace
     String good_pl   = "ILLUMINA"   # SAM-spec platform to set
@@ -24,9 +28,9 @@ workflow FixReadGroupPlatform {
     Int    additional_disk = 20
   }
 
-  call ReheaderCram {
+  call ReheaderReads {
     input:
-      input_cram      = input_cram,
+      input_reads     = input_reads,
       sample_name     = sample_name,
       bad_pl          = bad_pl,
       good_pl         = good_pl,
@@ -36,14 +40,14 @@ workflow FixReadGroupPlatform {
   }
 
   output {
-    File reheadered_cram      = ReheaderCram.reheadered_cram
-    File reheadered_cram_index = ReheaderCram.reheadered_cram_index
+    File reheadered_reads = ReheaderReads.reheadered_reads
+    File reheadered_index = ReheaderReads.reheadered_index
   }
 }
 
-task ReheaderCram {
+task ReheaderReads {
   input {
-    File   input_cram
+    File   input_reads
     String sample_name
     String bad_pl
     String good_pl
@@ -52,13 +56,25 @@ task ReheaderCram {
     Int    additional_disk
   }
 
-  # reheader copies the whole CRAM -> need room for input + output.
-  Int disk_gb = ceil(size(input_cram, "GB") * 2) + additional_disk
+  # reheader copies the whole file -> need room for input + output.
+  Int disk_gb = ceil(size(input_reads, "GB") * 2) + additional_disk
 
   command <<<
     set -euo pipefail
 
-    samtools view -H "~{input_cram}" > header.sam
+    # Detect format by content, not extension. CRAM files begin with the
+    # ASCII bytes "CRAM"; BAM files are bgzip (0x1f 0x8b ...). Anything that
+    # is not CRAM is treated as BAM.
+    if [ "$(head -c 4 "~{input_reads}")" = "CRAM" ]; then
+      ext=cram; idx=crai
+    else
+      ext=bam;  idx=bai
+    fi
+    echo "Detected format: ${ext}" >&2
+
+    samtools quickcheck "~{input_reads}" || { echo "ERROR: input failed samtools quickcheck" >&2; exit 1; }
+
+    samtools view -H "~{input_reads}" > header.sam
 
     # Tab-delimited @RG fields. Replace the exact PL value; append PM:<model>
     # once per @RG line that lacks a PM tag. Non-@RG lines pass through.
@@ -80,8 +96,9 @@ task ReheaderCram {
       exit 1
     fi
 
-    samtools reheader header.fixed.sam "~{input_cram}" > "~{sample_name}.reheadered.cram"
-    samtools index "~{sample_name}.reheadered.cram"
+    out="~{sample_name}.reheadered.${ext}"
+    samtools reheader header.fixed.sam "~{input_reads}" > "${out}"
+    samtools index "${out}"           # writes ${out}.${idx}
   >>>
 
   runtime {
@@ -93,7 +110,10 @@ task ReheaderCram {
   }
 
   output {
-    File reheadered_cram       = "~{sample_name}.reheadered.cram"
-    File reheadered_cram_index = "~{sample_name}.reheadered.cram.crai"
+    # Exactly one of each pair exists per run; flatten + index 0 picks it.
+    File reheadered_reads = flatten([glob("~{sample_name}.reheadered.bam"),
+                                     glob("~{sample_name}.reheadered.cram")])[0]
+    File reheadered_index = flatten([glob("~{sample_name}.reheadered.bam.bai"),
+                                     glob("~{sample_name}.reheadered.cram.crai")])[0]
   }
 }
