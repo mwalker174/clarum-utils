@@ -1,0 +1,15 @@
+# Cromwell / WDL local runs
+cromwell-executions/
+cromwell-workflow-logs/
+*.log
+
+# Data
+*.cram
+*.crai
+*.bam
+*.bai
+*.sam
+
+# OS / editor
+.DS_Store
+*.swp
