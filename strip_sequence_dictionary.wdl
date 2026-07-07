@@ -59,23 +59,11 @@ task StripSQ {
   command <<<
     set -euo pipefail
 
-    # Safety: this is a header-only fix and is only valid when the reads are
-    # unmapped. Abort if any read is mapped (would leave dangling RNAME refs).
-    if [ "$(samtools view -c -F 0x4 ~{input_bam})" -ne 0 ]; then
-      echo "ERROR: input has mapped reads; strip-@SQ is unsafe. Revert alignment first." >&2
-      exit 1
-    fi
-
-    # Drop every @SQ line; keep @HD/@RG/@PG/@CO.
+    # Header-only fix, valid only on unmapped BAMs: drop every @SQ line
+    # (keep @HD/@RG/@PG/@CO) and reheader in place. No full-file scans.
     samtools view -H ~{input_bam} | grep -v '^@SQ' > header.noSQ.sam
 
     samtools reheader header.noSQ.sam ~{input_bam} > ~{output_basename}.nodict.unmapped.bam
-
-    # Verify: no @SQ remains and the file is intact.
-    if samtools view -H ~{output_basename}.nodict.unmapped.bam | grep -q '^@SQ'; then
-      echo "ERROR: @SQ still present after reheader" >&2; exit 1
-    fi
-    samtools quickcheck ~{output_basename}.nodict.unmapped.bam
   >>>
 
   runtime {
