@@ -30,8 +30,9 @@ workflow QuerynameSortUbam {
     File   input_bam                       # an UNMAPPED BAM that is not queryname-sorted
     String output_basename = basename(input_bam, ".bam")
     String picard_docker = "us.gcr.io/broad-gotc-prod/picard-cloud:2.26.10"
-    Int    additional_disk_gb = 50
-    Int    mem_gb = 16
+    Int    additional_disk_gb = 20
+    Int    mem_gb = 7
+    Int    compression_level = 2
     Int    preemptible = 0
   }
 
@@ -42,6 +43,7 @@ workflow QuerynameSortUbam {
       docker             = picard_docker,
       additional_disk_gb = additional_disk_gb,
       mem_gb             = mem_gb,
+      compression_level  = compression_level,
       preemptible        = preemptible
   }
 
@@ -59,21 +61,36 @@ task SortQueryname {
     String docker
     Int    additional_disk_gb
     Int    mem_gb
+    Int    compression_level
     Int    preemptible
   }
 
-  # input + output + Picard spill-to-disk temp (~1x records each)
-  Int disk_gb = ceil(size(input_bam, "GB") * 3.25 + additional_disk_gb)
-  Int jvm_mem_mb = (mem_gb - 2) * 1024
+  # SortSam spills to disk heavily (MAX_RECORDS_IN_RAM=300000, uncompressed spill),
+  # so size the local disk for input + output + spill. Same 3.25x multiplier WARP
+  # uses for its SortSam task (tasks/broad/BamProcessing.wdl).
+  Int disk_gb        = ceil(size(input_bam, "GB") * 3.25 + additional_disk_gb)
+  Int machine_mem_mb = mem_gb * 1024
+  Int java_xmx_mb    = machine_mem_mb - 512
+  Int java_xms_mb    = machine_mem_mb - 1024
 
   command <<<
     set -euo pipefail
 
-    java -Xms~{jvm_mem_mb}m -Xmx~{jvm_mem_mb}m -jar /usr/gitc/picard.jar SortSam \
+    # Spill to the mounted local-disk (cwd), NOT /tmp: java.io.tmpdir defaults to
+    # /tmp, which on Terra/Cromwell is the small boot disk. Picard's TMP_DIR falls
+    # back to java.io.tmpdir, so set both. Use $PWD (resolves to the execution dir
+    # on the local-disk regardless of PAPIv2 /cromwell_root vs Batch mount path).
+    mkdir -p "${PWD}/tmp"
+
+    java -Dsamjdk.compression_level=~{compression_level} \
+      -Djava.io.tmpdir="${PWD}/tmp" \
+      -Xms~{java_xms_mb}m -Xmx~{java_xmx_mb}m \
+      -jar /usr/picard/picard.jar SortSam \
       INPUT=~{input_bam} \
       OUTPUT=~{output_basename}.qname_sorted.unmapped.bam \
       SORT_ORDER=queryname \
-      MAX_RECORDS_IN_RAM=3000000 \
+      MAX_RECORDS_IN_RAM=300000 \
+      TMP_DIR="${PWD}/tmp" \
       VALIDATION_STRINGENCY=SILENT \
       CREATE_INDEX=false \
       CREATE_MD5_FILE=false
@@ -83,7 +100,7 @@ task SortQueryname {
     docker: docker
     memory: mem_gb + " GB"
     cpu: 2
-    disks: "local-disk " + disk_gb + " HDD"
+    disks: "local-disk " + disk_gb + " SSD"
     preemptible: preemptible
   }
 
