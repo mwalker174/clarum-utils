@@ -30,7 +30,7 @@ workflow QuerynameSortUbam {
     File   input_bam                       # an UNMAPPED BAM that is not queryname-sorted
     String output_basename = basename(input_bam, ".bam")
     String picard_docker = "us.gcr.io/broad-gotc-prod/picard-cloud:2.26.10"
-    Int    additional_disk_gb = 20
+    Int    additional_disk_gb = 200
     Int    mem_gb = 7
     Int    compression_level = 2
     Int    preemptible = 0
