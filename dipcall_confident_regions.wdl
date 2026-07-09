@@ -123,8 +123,11 @@ task Dipcall {
   command <<<
     set -euo pipefail
 
-    # reference: decompress + index (samtools faidx needs a plain FASTA)
-    gzip -dc ~{ref_gz} > ref.fna
+    # reference: decompress + index (samtools faidx needs a plain FASTA).
+    # Strip defline metadata to the bare contig name -- the NCBI analysis-set
+    # fasta deflines carry trailing "AC:/gi:/LN:/rl:/M5:" fields that break the
+    # minimap2 -> samflt -> samtools sort header handling ("@SQ ... no LN tag").
+    gzip -dc ~{ref_gz} | awk '/^>/{print $1; next} {print}' > ref.fna
     samtools faidx ref.fna
 
     # GRCh38 pseudoautosomal regions on chrX (0-based, chr ids)
