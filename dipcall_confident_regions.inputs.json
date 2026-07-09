@@ -1,0 +1,14 @@
+{
+  "DipcallConfidentRegions.sample_ids": ["HG00514", "HG00733", "NA19240"],
+  "DipcallConfidentRegions.hap1_urls": [
+    "http://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/HGSVC3/working/20241001_verkko_HG00514_fix/assemblies/HG00514/HG00514.vrk-ps-sseq.asm-hap1.v2.fasta.gz",
+    "http://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/HGSVC3/working/20230818_verkko_batch1/assemblies/HG00733/HG00733.vrk-ps-sseq.asm-hap1.fasta.gz",
+    "http://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/HGSVC3/working/20240201_verkko_batch3/assemblies/NA19240/NA19240.vrk-ps-sseq.asm-hap1.fasta.gz"
+  ],
+  "DipcallConfidentRegions.hap2_urls": [
+    "http://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/HGSVC3/working/20241001_verkko_HG00514_fix/assemblies/HG00514/HG00514.vrk-ps-sseq.asm-hap2.v2.fasta.gz",
+    "http://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/HGSVC3/working/20230818_verkko_batch1/assemblies/HG00733/HG00733.vrk-ps-sseq.asm-hap2.fasta.gz",
+    "http://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/HGSVC3/working/20240201_verkko_batch3/assemblies/NA19240/NA19240.vrk-ps-sseq.asm-hap2.fasta.gz"
+  ],
+  "DipcallConfidentRegions.is_male": [false, false, false]
+}
