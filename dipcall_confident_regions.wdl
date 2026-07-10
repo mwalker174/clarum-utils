@@ -43,8 +43,11 @@ workflow DipcallConfidentRegions {
     # conda build mangled reference contig names in the @SQ header.)
     String dipcall_docker = "humanpangenomics/hpp_dipcall_v0.3:latest"
     String fetch_docker   = "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
-    Int cpu = 8
-    Int mem_gb = 32
+    # dipcall runs hap1+hap2 chains concurrently (make -j2); each is
+    # minimap2 (ref index ~11 GB) piped to samtools sort (-m4G x4 threads = 16 GB),
+    # so peak ~54 GB. 64 GB / 16 cpu matches HPRC's tested dipcall task; 32 GB OOM'd.
+    Int cpu = 16
+    Int mem_gb = 64
     Int disk_gb = 200
     Int preemptible = 1
   }
