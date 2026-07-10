@@ -123,6 +123,9 @@ task Dipcall {
     Int preemptible
   }
 
+  command <<<
+    set -euo pipefail
+
     KIT=/opt/dipcall/dipcall.kit
 
     # reference: decompress + index. Strip deflines to the bare contig name --
