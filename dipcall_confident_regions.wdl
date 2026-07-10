@@ -38,7 +38,10 @@ workflow DipcallConfidentRegions {
     # GRCh38 no-ALT analysis set (UCSC chr ids), gzipped. Matches the HGSVC3 truth.
     String ref_url = "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/GCA_000001405.15_GRCh38/seqs_for_alignment_pipelines.ucsc_ids/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz"
 
-    String dipcall_docker = "quay.io/biocontainers/dipcall:0.3--hdfd78af_0"
+    # HPRC's dipcall image -- ships the dipcall.kit with its own tested
+    # minimap2/samtools/k8/htsbox at /opt/dipcall/dipcall.kit. (The biocontainers
+    # conda build mangled reference contig names in the @SQ header.)
+    String dipcall_docker = "humanpangenomics/hpp_dipcall_v0.3:latest"
     String fetch_docker   = "gcr.io/google.com/cloudsdktool/cloud-sdk:slim"
     Int cpu = 8
     Int mem_gb = 32
@@ -120,26 +123,25 @@ task Dipcall {
     Int preemptible
   }
 
-  command <<<
-    set -euo pipefail
+    KIT=/opt/dipcall/dipcall.kit
 
-    # reference: decompress + index (samtools faidx needs a plain FASTA).
-    # Strip defline metadata to the bare contig name -- the NCBI analysis-set
-    # fasta deflines carry trailing "AC:/gi:/LN:/rl:/M5:" fields that break the
-    # minimap2 -> samflt -> samtools sort header handling ("@SQ ... no LN tag").
+    # reference: decompress + index. Strip deflines to the bare contig name --
+    # the NCBI analysis-set deflines carry trailing "AC:/gi:/LN:/rl:/M5:" fields;
+    # bare ">chrN" keeps the @SQ header clean regardless of the minimap2 build.
+    # run-dipcall requires ref.fna.fai to exist before it generates the makefile.
     gzip -dc ~{ref_gz} | awk '/^>/{print $1; next} {print}' > ref.fna
-    samtools faidx ref.fna
+    $KIT/samtools faidx ref.fna
 
-    # GRCh38 pseudoautosomal regions on chrX (0-based, chr ids)
-    printf 'chrX\t10000\t2781479\nchrX\t155701382\t156030895\n' > hs38.PAR.bed
+    # dipcall's kit reads plain (uncompressed) assembly FASTAs
+    gzip -dc ~{hap1_gz} > hap1.fa
+    gzip -dc ~{hap2_gz} > hap2.fa
 
     PAR_OPT=""
-    if [ "~{is_male}" = "true" ]; then PAR_OPT="-x hs38.PAR.bed"; fi
+    if [ "~{is_male}" = "true" ]; then PAR_OPT="-x $KIT/hs38.PAR.bed"; fi
 
     # run-dipcall emits a Makefile; make runs minimap2 -> filter -> sort ->
     # htsbox pileup -> vcfpair, and derives the diploid callable BED via bedtk.
-    # minimap2 reads gzipped haplotype FASTAs directly.
-    run-dipcall -t ~{cpu} $PAR_OPT ~{sample_id} ref.fna ~{hap1_gz} ~{hap2_gz} > ~{sample_id}.mak
+    $KIT/run-dipcall -t ~{cpu} $PAR_OPT ~{sample_id} ref.fna hap1.fa hap2.fa > ~{sample_id}.mak
     make -j2 -f ~{sample_id}.mak
 
     test -s ~{sample_id}.dip.bed
