@@ -37,7 +37,9 @@ workflow IGVSnapshotMutectVariants {
     Array[File] cram_indexes
     File ref_fasta
     File ref_fasta_index
-    Int buff = 25
+    File? pon_vcf
+    File? pon_vcf_index
+    Int buff = 75
     Int max_panel_height = 1200
     String docker = "us.gcr.io/broad-gotc-prod/genomes-in-the-cloud:2.5.7-2021-06-09_16-47-48Z"
     Int preemptible = 1
@@ -53,6 +55,8 @@ workflow IGVSnapshotMutectVariants {
         cram_index = cram_indexes[i],
         ref_fasta = ref_fasta,
         ref_fasta_index = ref_fasta_index,
+        pon_vcf = pon_vcf,
+        pon_vcf_index = pon_vcf_index,
         buff = buff,
         max_panel_height = max_panel_height,
         docker = docker,
@@ -77,13 +81,15 @@ task MakeSnapshots {
     File cram_index
     File ref_fasta
     File ref_fasta_index
+    File? pon_vcf
+    File? pon_vcf_index
     Int buff
     Int max_panel_height
     String docker
     Int preemptible
   }
 
-  Int disk_gb = ceil(size(cram, "GB") * 2 + size(ref_fasta, "GB") + 20)
+  Int disk_gb = ceil(size(cram, "GB") * 2 + size(ref_fasta, "GB") + size(pon_vcf, "GB") + 20)
 
   command <<<
     set -euo pipefail
@@ -98,6 +104,7 @@ task MakeSnapshots {
       --tsv ~{variant_tsv} --sample ~{sample} \
       --cram ~{cram} --crai ~{cram_index} \
       --fasta ~{ref_fasta} --fasta-idx ~{ref_fasta_index} \
+      ~{"--pon-vcf " + pon_vcf} ~{"--pon-vcf-idx " + pon_vcf_index} \
       --buff ~{buff} --max-panel-height ~{max_panel_height} \
       --out-dir out
 

@@ -35,7 +35,8 @@ def load_rows(tsv_path, sample):
     return rows
 
 
-def build_batch(rows, sample, cram, fasta, out_dir, buff=25, genome_id=None, max_panel_height=1200):
+def build_batch(rows, sample, cram, fasta, out_dir, buff=75, genome_id=None, max_panel_height=1200,
+                pon_vcf=None):
     screenshot_dir = os.path.join(out_dir, "screenshots")
     os.makedirs(screenshot_dir, exist_ok=True)
     batch_path = os.path.join(out_dir, "igv_batch.txt")
@@ -47,7 +48,14 @@ def build_batch(rows, sample, cram, fasta, out_dir, buff=25, genome_id=None, max
         f.write(f"genome {genome_id or fasta}\n")
         f.write(f"snapshotDirectory {screenshot_dir}\n")
         f.write(f"maxPanelHeight {max_panel_height}\n")
+        # Off by default in IGV 2.4.14 -- without this, insertion/deletion
+        # support that the aligner soft-clipped instead of representing as an
+        # indel op is invisible in the screenshot even when reads carry it
+        # (see IGV_REVIEW_SOP.md).
+        f.write("preference SAM.SHOW_SOFT_CLIPPED true\n")
         f.write(f"load {cram}\n")
+        if pon_vcf:
+            f.write(f"load {pon_vcf}\n")  # PoN-recurrence check, IGV_REVIEW_SOP.md
         for r in rows:
             chrom, pos, ref, alt = r["chrom"], int(r["pos"]), r["ref"], r["alt"]
             start, end = max(1, pos - buff), pos + buff
@@ -55,7 +63,11 @@ def build_batch(rows, sample, cram, fasta, out_dir, buff=25, genome_id=None, max
             png = f"{sample}__{chrom}-{pos}-{ref}-{alt}.png"
             f.write(f"goto {locus}\n")
             f.write(f"sort base {chrom}:{pos}\n")
-            f.write("colorBy READ_STRAND\n")   # supports the project's manual strand-balance check
+            # "colorBy" isn't a real batch command in IGV 2.4.14 (added in 2.19.2) --
+            # silently logged as an unknown command and ignored. "group strand" IS
+            # supported here (AlignmentTrack.GroupOption.STRAND) and gives the same
+            # visual fwd/rev separation the strand-balance check needs.
+            f.write("group strand\n")
             f.write("viewaspairs\n")
             f.write("squish\n")
             f.write(f"snapshot {png}\n")
@@ -79,8 +91,10 @@ def main():
     p.add_argument("--crai", help="unused directly by IGV (must sit alongside --cram); kept so WDL localizes it")
     p.add_argument("--fasta", required=True, help="reference fasta — must match the CRAM's contig naming (chr-prefixed b38)")
     p.add_argument("--fasta-idx", help="unused directly; kept so WDL localizes it")
+    p.add_argument("--pon-vcf", default=None, help="cross-cohort PoN VCF, loaded as a second track for PoN-recurrence check")
+    p.add_argument("--pon-vcf-idx", default=None, help="unused directly (Tribble .idx alongside --pon-vcf); kept so WDL localizes it")
     p.add_argument("--out-dir", default=".")
-    p.add_argument("--buff", type=int, default=25, help="flanking bp each side of the variant")
+    p.add_argument("--buff", type=int, default=75, help="flanking bp each side of the variant")
     p.add_argument("--max-panel-height", type=int, default=1200)
     p.add_argument("--genome-id", default=None, help="IGV registered genome ID to use instead of --fasta (e.g. hg38)")
     a = p.parse_args()
@@ -91,7 +105,7 @@ def main():
     os.makedirs(a.out_dir, exist_ok=True)
     batch_path, manifest_path = build_batch(
         rows, a.sample, a.cram, a.fasta, a.out_dir,
-        buff=a.buff, genome_id=a.genome_id, max_panel_height=a.max_panel_height)
+        buff=a.buff, genome_id=a.genome_id, max_panel_height=a.max_panel_height, pon_vcf=a.pon_vcf)
     print(f"[igv_batch] {len(rows)} variants for {a.sample} -> {batch_path}")
     print(f"[igv_batch] snapshot manifest -> {manifest_path}")
 
