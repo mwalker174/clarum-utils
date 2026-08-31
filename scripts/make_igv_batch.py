@@ -53,6 +53,10 @@ def build_batch(rows, sample, cram, fasta, out_dir, buff=75, genome_id=None, max
         # indel op is invisible in the screenshot even when reads carry it
         # (see IGV_REVIEW_SOP.md).
         f.write("preference SAM.SHOW_SOFT_CLIPPED true\n")
+        # Draws a vertical line at the exact screenshot-center coordinate so a
+        # reviewer can tell which column is the variant without counting bp
+        # ticks -- goto centers the locus pixel-exact, but nothing marked it.
+        f.write("preference SAM.SHOW_CENTER_LINE true\n")
         f.write(f"load {cram}\n")
         if pon_vcf:
             f.write(f"load {pon_vcf}\n")  # PoN-recurrence check, IGV_REVIEW_SOP.md
