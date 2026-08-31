@@ -24,6 +24,15 @@ version 1.0
 ## Terra can localize it (e.g. uploaded to the workspace bucket) — kept as a
 ## single checked-in source of truth rather than duplicated inline here.
 ##
+## bamouts/bamout_indexes (optional, parallel to samples): Mutect2
+## --bam-output BAMs. IGV renders BWA's alignment, but Mutect2 calls from its
+## own reassembled haplotypes, so a site can look unreadable in the CRAM and
+## still be a confident call. When supplied, each site gets a second
+## screenshot (__bamout.png) with the bamout loaded and reads grouped by the
+## HC haplotype tag, i.e. the caller's own view of the same reads. Produce
+## them by rerunning the stock broadinstitute/gatk mutect2 WDL with
+## make_bamout=true over an interval list covering just the review sites.
+##
 ## Output per sample: a tarball of screenshots + a snapshot_manifest.tsv
 ## (variant row -> expected .png filename) to reconcile against after a
 ## human looks at the pictures and fills in igv_verdict/notes.
@@ -39,6 +48,8 @@ workflow IGVSnapshotMutectVariants {
     File ref_fasta_index
     File? pon_vcf
     File? pon_vcf_index
+    Array[File] bamouts = []
+    Array[File] bamout_indexes = []
     Int buff = 75
     Int max_panel_height = 1200
     String docker = "us.gcr.io/broad-gotc-prod/genomes-in-the-cloud:2.5.7-2021-06-09_16-47-48Z"
@@ -46,6 +57,15 @@ workflow IGVSnapshotMutectVariants {
   }
 
   scatter (i in range(length(samples))) {
+    # Declaring inside a conditional yields an optional outside it, which is
+    # how an empty default array stays compatible with the task's File? input.
+    if (length(bamouts) > 0) {
+      File bamout_i = bamouts[i]
+    }
+    if (length(bamout_indexes) > 0) {
+      File bamout_index_i = bamout_indexes[i]
+    }
+
     call MakeSnapshots {
       input:
         variant_tsv = variant_tsv,
@@ -57,6 +77,8 @@ workflow IGVSnapshotMutectVariants {
         ref_fasta_index = ref_fasta_index,
         pon_vcf = pon_vcf,
         pon_vcf_index = pon_vcf_index,
+        bamout = bamout_i,
+        bamout_index = bamout_index_i,
         buff = buff,
         max_panel_height = max_panel_height,
         docker = docker,
@@ -83,13 +105,16 @@ task MakeSnapshots {
     File ref_fasta_index
     File? pon_vcf
     File? pon_vcf_index
+    File? bamout
+    File? bamout_index
     Int buff
     Int max_panel_height
     String docker
     Int preemptible
   }
 
-  Int disk_gb = ceil(size(cram, "GB") * 2 + size(ref_fasta, "GB") + size(pon_vcf, "GB") + 20)
+  Int disk_gb = ceil(size(cram, "GB") * 2 + size(ref_fasta, "GB") + size(pon_vcf, "GB")
+                     + size(bamout, "GB") + 20)
 
   command <<<
     set -euo pipefail
@@ -105,6 +130,7 @@ task MakeSnapshots {
       --cram ~{cram} --crai ~{cram_index} \
       --fasta ~{ref_fasta} --fasta-idx ~{ref_fasta_index} \
       ~{"--pon-vcf " + pon_vcf} ~{"--pon-vcf-idx " + pon_vcf_index} \
+      ~{"--bamout " + bamout} ~{"--bamout-index " + bamout_index} \
       --buff ~{buff} --max-panel-height ~{max_panel_height} \
       --out-dir out
 

@@ -36,7 +36,7 @@ def load_rows(tsv_path, sample):
 
 
 def build_batch(rows, sample, cram, fasta, out_dir, buff=75, genome_id=None, max_panel_height=1200,
-                pon_vcf=None):
+                pon_vcf=None, bamout=None):
     screenshot_dir = os.path.join(out_dir, "screenshots")
     os.makedirs(screenshot_dir, exist_ok=True)
     batch_path = os.path.join(out_dir, "igv_batch.txt")
@@ -75,11 +75,51 @@ def build_batch(rows, sample, cram, fasta, out_dir, buff=75, genome_id=None, max
             f.write("viewaspairs\n")
             f.write("squish\n")
             f.write(f"snapshot {png}\n")
-            manifest_rows.append({**r, "locus": locus, "png": png})
+            row = {**r, "locus": locus, "png": png}
+            if bamout:
+                row["png_bamout"] = f"{sample}__{chrom}-{pos}-{ref}-{alt}__bamout.png"
+            manifest_rows.append(row)
+
+        # Second pass over the same sites with Mutect2's bamout loaded.
+        #
+        # IGV shows BWA's alignment, but Mutect2 doesn't call from that -- it
+        # reassembles the active region into haplotypes and realigns reads to
+        # them with PairHMM, and AD/TLOD come from that realignment. So a site
+        # that looks unreadable here can still be a confident call, and the
+        # only way to see the caller's own view is bamout (GATK --bam-output).
+        # Reads carry an HC tag naming the haplotype they were assigned to;
+        # grouping on it splits the pileup the way the caller split it.
+        #
+        # Separate screenshots rather than one combined image because IGV's
+        # "group" applies to every alignment track at once -- there is no
+        # per-track form -- so the CRAM cannot stay grouped by strand while
+        # the bamout is grouped by HC.
+        if bamout:
+            f.write(f"load {bamout}\n")
+            # GroupOption.TAG exists in 2.4.14 and getAlignmentGroupOption
+            # falls through to valueOf(), so "group TAG HC" resolves even
+            # though only strand/sample/library/read_group are named
+            # explicitly in that method.
+            f.write("group TAG HC\n")
+            for r in rows:
+                chrom, pos, ref, alt = r["chrom"], int(r["pos"]), r["ref"], r["alt"]
+                start, end = max(1, pos - buff), pos + buff
+                locus = f"{chrom}:{start}-{end}"
+                png = f"{sample}__{chrom}-{pos}-{ref}-{alt}__bamout.png"
+                f.write(f"goto {locus}\n")
+                f.write(f"sort base {chrom}:{pos}\n")
+                # No viewaspairs: the artificial haplotype records bamout adds
+                # aren't paired, and pairing the real reads hides the
+                # read-to-haplotype assignment this pass exists to show.
+                f.write("squish\n")
+                f.write(f"snapshot {png}\n")
+
         f.write("exit\n")
 
     with open(manifest_path, "w", newline="") as f:
         fieldnames = list(manifest_rows[0].keys()) if manifest_rows else ["sample", "chrom", "pos", "ref", "alt", "locus", "png"]
+        if bamout and "png_bamout" not in fieldnames:
+            fieldnames.append("png_bamout")
         w = csv.DictWriter(f, fieldnames=fieldnames, delimiter="\t")
         w.writeheader()
         w.writerows(manifest_rows)
@@ -97,6 +137,10 @@ def main():
     p.add_argument("--fasta-idx", help="unused directly; kept so WDL localizes it")
     p.add_argument("--pon-vcf", default=None, help="cross-cohort PoN VCF, loaded as a second track for PoN-recurrence check")
     p.add_argument("--pon-vcf-idx", default=None, help="unused directly (Tribble .idx alongside --pon-vcf); kept so WDL localizes it")
+    p.add_argument("--bamout", help="Mutect2 --bam-output BAM (reads realigned to assembled haplotypes); "
+                                    "adds a second screenshot per site grouped by the HC haplotype tag")
+    p.add_argument("--bamout-index", help="unused directly by IGV (must sit alongside --bamout); kept so the "
+                                          "WDL localizes it")
     p.add_argument("--out-dir", default=".")
     p.add_argument("--buff", type=int, default=75, help="flanking bp each side of the variant")
     p.add_argument("--max-panel-height", type=int, default=1200)
@@ -109,7 +153,8 @@ def main():
     os.makedirs(a.out_dir, exist_ok=True)
     batch_path, manifest_path = build_batch(
         rows, a.sample, a.cram, a.fasta, a.out_dir,
-        buff=a.buff, genome_id=a.genome_id, max_panel_height=a.max_panel_height, pon_vcf=a.pon_vcf)
+        buff=a.buff, genome_id=a.genome_id, max_panel_height=a.max_panel_height, pon_vcf=a.pon_vcf,
+                                        bamout=a.bamout)
     print(f"[igv_batch] {len(rows)} variants for {a.sample} -> {batch_path}")
     print(f"[igv_batch] snapshot manifest -> {manifest_path}")
 

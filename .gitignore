@@ -13,3 +13,5 @@ cromwell-workflow-logs/
 # OS / editor
 .DS_Store
 *.swp
+__pycache__/
+*.pyc
