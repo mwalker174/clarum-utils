@@ -26,31 +26,58 @@ version 1.0
 ## `File? input_bam`, but it rebuilds uBAMs and re-runs MarkDuplicates / BQSR /
 ## HaplotypeCaller / gVCF: a re-process (~$15-20/sample), not a conversion.
 ##
-## The reference is the whole ballgame
-## ----------------------------------
+## The reference is the whole ballgame - and it is settled
+## -------------------------------------------------------
 ## CRAM stores differences against a reference and pins that reference by MD5, so the
-## CRAM is only decompressible against a byte-identical FASTA. The delivered BAMs are
+## CRAM is only decompressible against a byte-identical FASTA. The delivered ES BAMs are
 ## DRAGEN-aligned and do NOT tell us which hg38 they used:
 ##
 ##   @PG ID: Hash Table Build  CL: /opt/edico/bin/dragen --ht-reference=.../Hsapiens/hg38/seq/hg38.fa
 ##   @PG ID: DRAGEN SW build   CL: /opt/dragen/4.2.4-2-1-g3ac86beb/bin/dragen -r /seq/dragen/references/hg38/dragen_komodo/
 ##   @HD VN:1.4 SO:coordinate   3366 x @SQ, M5 on NONE of them
 ##
-## 3,366 contigs is also the count in Broad's hg38/v0/Homo_sapiens_assembly38.fasta,
-## which makes it look interchangeable - it is not: 2,841 @SQ name+length entries match
-## Broad's .fai, but 525 differ, all in the HLA block (this BAM carries `HLA-A*01`,
-## `HLA-A*01:01:38L`, ...; Broad's carries `HLA-A*01:01:01:01`, `HLA-A*01:02`, ...).
-## With no M5 in the header there is nothing to cross-check at runtime, so:
+## An earlier draft of this header claimed the delivered contig dictionary disagreed
+## with Broad's on 525 HLA names. That was wrong (a diff against a missing file).
+## Measured against `Homo_sapiens_assembly38.fasta`: ALL 3,366 @SQ name+length entries
+## match, in the same order, and every one of those 3,366 contigs carries reads - so the
+## full ALT/HLA/decoy build is required, not a no-alt analysis set.
 ##
-##   1. pass the EXACT FASTA DRAGEN used (ask BI for its md5), and
-##   2. let the built-in round-trip check prove it - it re-reads the CRAM and compares
-##      records against the source BAM over sampled windows. A wrong reference shows up
-##      there as mismatched SEQ/QUAL, not as a silent corruption.
+## The reference is `gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.fasta`
+## (file md5 7ff134953dcca8c8997453bbb80b6b5e, per-sequence md5 22f6161a7683386226afe1831a4fafc6).
+## Three independent lines of evidence, all in `docs/progress/070`:
 ##
-## Contig NAMES are unaffected (primary + ALT names match Broad's), so gVCF/BAM joint
-## calling is not at risk; only CRAM decompression is. That includes the ARPA-H Commons
-## side: whoever unpacks these CRAMs needs the same FASTA, so record its md5 alongside
-## the deliverable.
+##   1. The BI-delivered GS CRAMs pin per-contig M5 for 3,366/3,366 contigs, and those
+##      values equal this FASTA's 3,366/3,366 - across three cohorts (ACH, BCH, CSG),
+##      which also agree with each other. Table: `data/qc-inputs/bi_gs_cram_sq_m5.tsv`,
+##      rebuilt with `src/scripts/reference_m5_table.py`.
+##   2. Genome-wide NM audit of this very BAM vs this FASTA: 55,531 pure-M reads over
+##      3,783 sampled windows on 1,203 contigs (primary, HLA, ALT, decoy, chrUn) -
+##      99.888% reproduce DRAGEN's own NM exactly. Artifacts under
+##      `artifacts/qc/moc11_prospective_es/cram/`, tool `src/scripts/verify_reference_against_bam.py`.
+##   3. A local BAM->CRAM->SAM round trip of 616,215 real records from this BAM decoded
+##      byte-for-byte as the source (core fields + full tag set).
+##
+## What the 0.112% NM disagreement is
+## ----------------------------------
+## Three windows out of 3,783 disagree systematically, and each disagreement sits on an
+## exact dbSNP ALT allele (chr22:20337902 rs28411685 C>A, chr15:20398748 rs1846757 A>G,
+## chr16:18076851 rs199761340 C>T) carried by reads with NM=0. The same site in unrelated
+## BCH samples charges NM=2..4 for the same base. That is the pop-alt/graph path in the
+## HT-build @PG (`--ht-pop-alt-contigs ... 32global.af.05... --ht-pop-alt-liftover ...`):
+## a read aligned on a pop-alt contig is re-emitted at primary coordinates with NM scored
+## on that contig. It is DRAGEN's NM bookkeeping, not a different FASTA - so **do not gate
+## conversion on NM or MD**. An earlier version of this task inferred reference identity
+## from NM-vs-MD agreement; that heuristic fires on exactly these legitimate sites, so it
+## is replaced by the deterministic `reference_m5_table` comparison below.
+##
+## The near-miss hazard is real and it is partial, not total
+## ---------------------------------------------------------
+## Decoding a CRAM built on this FASTA against a copy with ONE chrM base changed gives
+## `MD5 checksum reference mismatch at chrM:827-1002` and exit 1 - but only after
+## emitting ~20k reads from earlier slices, of which some came back with altered SEQ.
+## So: never pipe a decode into `head`, never `|| true` over its exit status, and never
+## trust output from a run that did not exit 0. `REF_PATH=:` is exported so htslib cannot
+## fetch a *different* hg38 from EBI mid-run instead of failing.
 ##
 ## Operational notes
 ## -----------------
@@ -76,6 +103,14 @@ workflow BamToCram {
     # The reference DRAGEN used. Required, deliberately un-defaulted - see the header.
     File    ref_fasta
     File    ref_fasta_index
+    # md5 of ref_fasta itself (broad hg38/v0 FASTA = 7ff134953dcca8c8997453bbb80b6b5e).
+    # Set it: it turns "we pointed at a hg38" into "we pointed at THE hg38 we audited".
+    String  ref_fasta_md5 = ""
+    # Per-contig M5 the delivery expects (contig/length/m5 TSV, see reference_m5_table.py).
+    # Our CRAM's own @SQ M5 must equal it, else the CRAM is pinned to a reference the
+    # Commons cannot reproduce. Optional only because the file has to be staged in a
+    # CLARUM bucket first.
+    File?   reference_m5_table
 
     # BI ships the index and the BAM md5 in separate snapshot rows.
     File?   input_bam_index
@@ -117,6 +152,8 @@ workflow BamToCram {
       output_basename          = output_basename,
       ref_fasta                = ref_fasta,
       ref_fasta_index          = ref_fasta_index,
+      ref_fasta_md5            = ref_fasta_md5,
+      reference_m5_table       = reference_m5_table,
       run_roundtrip            = run_roundtrip,
       strict_roundtrip         = strict_roundtrip,
       roundtrip_window_bp      = roundtrip_window_bp,
@@ -151,6 +188,8 @@ workflow BamToCram {
     File    output_cram_md5         = ConvertBamToCram.output_cram_md5
     File    output_cram_index_md5   = ConvertBamToCram.output_cram_index_md5
     File    integrity_report        = ConvertBamToCram.integrity_report
+    File?   roundtrip_report        = ConvertBamToCram.roundtrip_report
+    File?   reference_m5_check      = ConvertBamToCram.reference_m5_check
     Boolean roundtrip_identical     = ConvertBamToCram.roundtrip_identical
     File?   validation_report       = ValidateCram.report
   }
@@ -176,6 +215,8 @@ task ConvertBamToCram {
 
     File    ref_fasta
     File    ref_fasta_index
+    String  ref_fasta_md5
+    File?   reference_m5_table
 
     Boolean run_roundtrip
     Boolean strict_roundtrip
@@ -199,12 +240,42 @@ task ConvertBamToCram {
     set -euo pipefail
 
     BAM="$(basename '~{input_bam}')"
-    REF="~{ref_fasta}"
     OUT="~{output_basename}"
     CPU="~{cpu}"
 
     echo "== toolchain" | tee integrity.txt
     samtools --version | head -2 | tee -a integrity.txt
+
+    # ---- reference: prove which hg38 this is, before spending an hour on it --------
+    # htslib only checks reference md5 when it decodes a slice, so a wrong FASTA can
+    # burn the whole conversion before it says anything. Check the file md5 up front.
+    #
+    # Also re-link it under its canonical name and hand samtools THAT path: htslib
+    # writes @SQ UR from the -T argument, so this is what the delivered CRAM will say
+    # about where its reference lives. The default would be Cromwell's per-run
+    # localization directory, which is meaningless after the job exits (the BI-delivered
+    # CRAMs carry M5 and no UR at all; identity there is md5-only, as it is here).
+    REFSRC="~{ref_fasta}"
+    REFBASE="$(basename "$REFSRC")"
+    ln "$REFSRC" "./$REFBASE" 2>/dev/null || cp "$REFSRC" "./$REFBASE"
+    ln "~{ref_fasta_index}" "./${REFBASE}.fai" 2>/dev/null || cp "~{ref_fasta_index}" "./${REFBASE}.fai"
+    REF="./$REFBASE"
+    REF_MD5=$(md5sum "$REF" | awk '{print $1}')
+    echo "reference = ${REFBASE} md5=${REF_MD5} size=$(wc -c < "$REF")" >> integrity.txt
+    if [ -n "~{ref_fasta_md5}" ] && [ "${REF_MD5}" != "~{ref_fasta_md5}" ]; then
+      echo "FATAL: reference md5 ${REF_MD5} != expected ~{ref_fasta_md5}" >&2
+      exit 1
+    fi
+    if [ ! -s "${REF}.fai" ]; then
+      echo "FATAL: reference index ${REFBASE}.fai is empty" >&2
+      exit 1
+    fi
+    N_FA=$(cut -f1 "${REF}.fai" | sort -u | wc -l | tr -d ' ')
+    N_SQ=$(samtools view -H "${BAM}" 2>/dev/null | awk -F'\t' '$1=="@SQ"{n++}END{print n+0}')
+    echo "contigs: fasta=${N_FA} bam_@SQ=${N_SQ}" >> integrity.txt
+    if [ "${N_FA}" != "${N_SQ}" ]; then
+      echo "WARNING: reference contig count (${N_FA}) != BAM @SQ count (${N_SQ}) - CRAM encode will fail or skip contigs" >> integrity.txt
+    fi
 
     # ---- index: trust-but-verify the delivered .bai -------------------------------
     # htslib looks for "<bam>.bai" (or an adjacent .csi) and this BAM is a localized
@@ -246,8 +317,9 @@ task ConvertBamToCram {
     # ---- convert ------------------------------------------------------------------
     # -T gives the compressor the reference directly (no REF_DOWNLOAD); -@ is the
     # multi-threaded cram encoder. No --force-reads: if htslib cannot read this BAM
-    # cleanly we want to know.
-    samtools view -C -@ "${CPU}" -T "${REF}" -o "${OUT}.cram" "${BAM}"
+    # cleanly we want to know. version=3.0 explicitly: it is what the delivered GS CRAMs
+    # are and what every consumer here can read; 4.0 would be a unilateral change.
+    samtools view -C -@ "${CPU}" -O cram,version=3.0 -T "${REF}" -o "${OUT}.cram" "${BAM}"
     samtools quickcheck -v "${OUT}.cram" | tee -a integrity.txt
 
     md5sum "${OUT}.cram" | awk '{print $1}' > "${OUT}.cram.md5"
@@ -275,14 +347,49 @@ task ConvertBamToCram {
     echo "cram md5 = $(cat ${OUT}.cram.md5)  size = $(wc -c < ${OUT}.cram)" >> integrity.txt
     echo "crai md5 = $(cat ${OUT}.cram.crai.md5)  size = $(wc -c < ${OUT}.cram.crai)" >> integrity.txt
 
+    # ---- reference identity: what this CRAM now pins ------------------------------
+    # The @SQ M5 written at encode time IS the identity claim a consumer will check.
+    # If a table of expected M5 is supplied, compare against it and make disagreement
+    # fatal: a CRAM pinned to a reference the ARPA-H Commons cannot reproduce is not a
+    # deliverable, however faithfully it round-trips locally. Built from the BI-delivered
+    # GS CRAM headers by src/scripts/reference_m5_table.py.
+    samtools view -H "${OUT}.cram" \
+      | awk -F'\t' 'BEGIN{OFS="\t"} $1=="@SQ"{sn="";ln="";m5="";
+          for(i=2;i<=NF;i++){t=substr($i,1,2); v=substr($i,4);
+            if(t=="SN")sn=v; else if(t=="LN")ln=v; else if(t=="M5")m5=tolower(v)}
+          if(sn!="")print sn,ln,m5}' > cram_sq.tsv
+    N_SQ_M5=$(awk 'NF>=3 && $3!=""' cram_sq.tsv | wc -l | tr -d ' ')
+    echo "cram @SQ=$(wc -l < cram_sq.tsv | tr -d ' ') with M5=${N_SQ_M5}" >> integrity.txt
+    M5_TABLE="~{default="" reference_m5_table}"
+    if [ -n "${M5_TABLE}" ]; then
+      awk -F'\t' -v t="${M5_TABLE}" '
+        NR==FNR { if ($0 ~ /^#/) next; exp[$1]=$3; len[$1]=$2; n++; next }
+        { e = exp[$1]
+          if (e == "")      { absent++; if (absent<4) print "  not in table: " $1 > "/dev/stderr" }
+          else if ($3 != e) { bad++;  printf "  %s expected=%s got=%s\n", $1, e, $3 > "/dev/stderr" }
+          else              { ok++ }
+          if (len[$1] != "" && len[$1] != $2) lbad++ }
+        END { printf "REFERENCE_M5=%s ok=%d mismatched=%d not_in_table=%d length_mismatch=%d (table has %d contigs)\n",
+                (bad+lbad>0 ? "MISMATCH" : "MATCH"), ok+0, bad+0, absent+0, lbad+0, n }' \
+        "${M5_TABLE}" cram_sq.tsv > m5_check.txt 2>> m5_check.txt
+      cat m5_check.txt >> integrity.txt
+      if grep -q 'REFERENCE_M5=MISMATCH' m5_check.txt; then
+        echo "FATAL: CRAM @SQ M5 disagrees with the expected reference table" >&2
+        cat m5_check.txt >&2
+        exit 1
+      fi
+    else
+      echo "REFERENCE_M5=NOT_CHECKED (no reference_m5_table supplied)" >> integrity.txt
+    fi
+
     # ---- round trip: does the CRAM read back as the BAM? ---------------------------
-    # This is the only available proof that REF is the reference DRAGEN aligned
-    # against: a wrong FASTA decodes different SEQ/QUAL, which shows up here. Sampled
-    # windows keep it cheap (~1-2 min); restrict to primary contigs because HLA contig
-    # names contain ':' and are therefore region-string-hostile.
+    # Sampled windows keep it cheap (~1-2 min). Restricted to primary contigs because
+    # HLA contig NAMES contain ':' and are therefore hostile in a region string; the
+    # HLA/ALT/decoy block is covered offline by src/scripts/verify_reference_against_bam.py.
     echo "ROUNDTRIP=SKIPPED" > roundtrip.txt
     RT_FAIL=0
     if [ "~{run_roundtrip}" = "true" ]; then
+      : > roundtrip.err
       samtools view -H "${OUT}.cram" 2>/dev/null \
         | awk -F'\t' '$1=="@SQ"{n=substr($2,4); l=substr($3,4); if (n ~ /^chr[0-9XY]+$/) print l"\t"n}' \
         | sort -rn | head -n "~{roundtrip_contigs}" \
@@ -296,52 +403,48 @@ task ConvertBamToCram {
         # a region: on these BAMs every record carries an RG tag, so `-r chr1:1-20000`
         # selects records in that read group (none) and the comparison would pass
         # vacuously on two empty files.
-        samtools view -T "${REF}" "${BAM}" "${W}"  > a.sam 2>/dev/null || true
-        samtools view -T "${REF}" "${OUT}.cram" "${W}" > b.sam 2>/dev/null || true
+        RCA=0; RCB=0
+        # Exit status is part of the evidence: htslib reports a reference md5 mismatch
+        # per SLICE, after it has already emitted the reads of earlier slices. Swallowing
+        # the failure (|| true) and comparing two truncated files would read as a mere
+        # record-count difference and hide the diagnosis.
+        samtools view -T "${REF}" "${BAM}" "${W}" > a.sam 2>> roundtrip.err                || RCA=$?
+        samtools view -T "${REF}" "${OUT}.cram" "${W}" > b.sam 2>> roundtrip.err           || RCB=$?
         NA=$(wc -l < a.sam | tr -d ' '); NB=$(wc -l < b.sam | tr -d ' ')
         if cmp -s a.sam b.sam; then
-          FULL=MATCH; CORE=MATCH
+          FULL=MATCH; CORE=MATCH; TAGS=MATCH
         else
           FULL=MISMATCH
-          # A full-record mismatch is EXPECTED here even for a perfect conversion:
-          # htslib's CRAM decoder re-derives the MD:Z tag from the reference on
-          # read-back (there is no --no-MD switch in `samtools view`), so the CRAM side
-          # carries tags the BAM never had. The gate is therefore the core alignment
-          # fields (QNAME FLAG RNAME POS MAPQ CIGAR RNEXT PNEXT TLEN SEQ QUAL), sorted
-          # so that tag order cannot matter: a wrong reference changes SEQ/QUAL.
-          for f in a b; do cut -f1-11 $f.sam | LC_ALL=C sort > $f.core; done
+          # A byte-identical SAM is NOT expected even for a perfect conversion, for two
+          # benign reasons measured on the delivered BAM (616,215 records, docs/progress/070):
+          #   - htslib re-derives MD:Z on read-back in some slices (the source has none:
+          #     DRAGEN ran with generate-md-tags=false);
+          #   - CRAM stores tags in its own order.
+          # So: (core) the 11 alignment fields, sorted - a wrong reference changes SEQ/QUAL;
+          #      (tags) every tag VALUE in the window as a sorted field multiset, minus MD.
+          for f in a b; do
+            cut -f1-11 $f.sam | LC_ALL=C sort > $f.core
+            { cut -f1-11 $f.sam; cut -f12- $f.sam | tr '\t' '\n' | grep -v '^MD:Z:' || true; } \
+              | LC_ALL=C sort > $f.tags
+          done
           if cmp -s a.core b.core; then CORE=MATCH; else CORE=MISMATCH; fi
+          if cmp -s a.tags  b.tags;  then TAGS=MATCH;  else TAGS=MISMATCH;  fi
         fi
-        echo "window ${W} bam_records=${NA} cram_records=${NB} full=${FULL} core=${CORE}" >> roundtrip.txt
-
-        # Reference-identity cross-check (informational). The round trip above can only
-        # prove the CRAM is lossless against the FASTA we handed it - CRAM stores
-        # differences against whatever reference it was given, so a near-miss hg38 still
-        # round-trips perfectly. What DOES betray a wrong reference is the mismatch
-        # count: NM:i comes from DRAGEN's own alignment (their reference), MD:Z is
-        # re-derived on read-back from OUR reference. Where the two disagree, the two
-        # references differ. Reported, not gated: soft clips and indels make MD and NM
-        # legitimately unequal on individual reads.
-        awk -F'\t' -v w="${W}" '{nm=""; md=""
-            for(i=12;i<=NF;i++){ if($i ~ /^NM:i:/){split($i,a,":"); nm=a[3]} else if($i ~ /^MD:Z:/){md=substr($i,6)} }
-            isnm=(nm=="0"); ismd=(md!="" && md !~ /[ACGTN]/)
-            if(isnm)nm0++; if(ismd)md0++; if(isnm&&ismd)both++ }
-          END{ v="UNKNOWN"; m=(nm0<md0?nm0:md0)
-            if(m==0) v="NO_INFORMATIVE_RECORDS"; else if(both >= 0.9*m) v="PLAUSIBLE"; else v="SUSPECT"
-            printf "ref_agreement %s nm0=%d md0=%d both=%d verdict=%s\n", w, nm0+0, md0+0, both+0, v }' \
-          b.sam >> roundtrip.txt
+        echo "window ${W} bam_records=${NA} cram_records=${NB} bam_exit=${RCA} cram_exit=${RCB} full=${FULL} core=${CORE} tags=${TAGS}" >> roundtrip.txt
 
         # An empty window proves nothing, so it must not count as a pass.
-        if [ "${CORE}" != "MATCH" ] || [ "${NA}" != "${NB}" ] || [ "${NA}" -eq 0 ]; then
+        if [ "${CORE}" != "MATCH" ] || [ "${TAGS}" != "MATCH" ] || [ "${NA}" != "${NB}" ] \
+           || [ "${NA}" -eq 0 ] || [ "${RCA}" -ne 0 ] || [ "${RCB}" -ne 0 ]; then
           RT_FAIL=$((RT_FAIL + 1))
         fi
-        rm -f a.sam b.sam a.core b.core
+        rm -f a.sam b.sam a.core b.core a.tags b.tags
       done < windows.txt
       echo "roundtrip: windows=${RT_N} failing=${RT_FAIL}" >> integrity.txt
-      SUS=$(grep -c 'verdict=SUSPECT' roundtrip.txt || true)
-      if [ "${SUS}" -gt 0 ]; then
-        echo "REF_AGREEMENT=SUSPECT on ${SUS} of ${RT_N} windows - this reference may not be the one DRAGEN aligned against" >> integrity.txt
+      if [ -s roundtrip.err ]; then
+        echo "roundtrip stderr (first 20 lines):" >> integrity.txt
+        head -20 roundtrip.err >> integrity.txt
       fi
+
       # An empty window list means the @SQ parse found no primary contigs - that is a
       # failed test, not a passed one, so it must not read back as roundtrip_identical.
       if [ "${RT_N}" -eq 0 ]; then
@@ -379,7 +482,8 @@ task ConvertBamToCram {
     File output_cram_index_md5 = "~{output_basename}.cram.crai.md5"
 
     File integrity_report      = "integrity.txt"
-    File roundtrip_report      = "roundtrip.txt"
+    File? roundtrip_report     = "roundtrip.txt"
+    File? reference_m5_check   = "m5_check.txt"
     File input_bam_md5_computed = "input_bam_md5_computed.txt"
     File bam_idxstats          = "bam_idxstats.txt"
     Boolean roundtrip_identical = read_string("roundtrip_identical.txt") == "true"
