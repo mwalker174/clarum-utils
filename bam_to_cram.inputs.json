@@ -1,0 +1,9 @@
+{
+  "BamToCram.input_bam": "gs://datarepo-e6f844bb-bucket/6eff2645-2f64-49d4-ab90-f6fdf88ced18/883d659a-8e0a-4441-86ef-5c288a6b1e65/ACH0024_LM17.bam",
+  "BamToCram.bam_index_path": "gs://datarepo-e6f844bb-bucket/6eff2645-2f64-49d4-ab90-f6fdf88ced18/9d7d6b83-3d8b-4d88-a0b0-7c877f0fe3e2/ACH0024_LM17.bam.bai",
+  "BamToCram.bam_md5_path": "gs://datarepo-e6f844bb-bucket/6eff2645-2f64-49d4-ab90-f6fdf88ced18/707a18bc-c9d4-43a7-b742-582361583914/ACH0024_LM17.bam.md5sum",
+  "BamToCram.output_basename": "ACH0024_LM17",
+  "BamToCram.ref_fasta": "gs://REPLACE-WITH-CLARUM-ANALYSIS-BUCKET/references/dragen_hg38/hg38.fa",
+  "BamToCram.ref_fasta_index": "gs://REPLACE-WITH-CLARUM-ANALYSIS-BUCKET/references/dragen_hg38/hg38.fa.fai",
+  "BamToCram.preemptible": 0
+}
