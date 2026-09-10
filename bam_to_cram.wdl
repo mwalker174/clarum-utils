@@ -113,10 +113,19 @@ workflow BamToCram {
     File?   reference_m5_table
 
     # BI ships the index and the BAM md5 in separate snapshot rows.
+    #
+    # Keep these File? ALL THE WAY INTO THE TASK. They used to be aliased
+    #   String bam_index_path = select_first([input_bam_index, ""])
+    # which is a File->String cast evaluated in the WORKFLOW, where no localization
+    # exists yet: it yields the original gs:// URI, and because nothing File-typed
+    # reaches the task, Cromwell does not localize those two objects at all. Both
+    # halves were proved on submission 58698ceb-782a-46a2-9384-89f063edb192 - the
+    # rendered task script contained `cp "gs://datarepo-e6f844bb-bucket/…bai"` (no
+    # gsutil in the samtools image) and its gcs_localization.sh listed only the BAM
+    # and the reference. Passing the File? through unchanged is what makes Cromwell
+    # localize it and interpolate an in-container path.
     File?   input_bam_index
     File?   input_bam_md5                  # a "<hash>  <name>" text file, as delivered
-    String  bam_index_path = select_first([input_bam_index, ""])
-    String  bam_md5_path   = select_first([input_bam_md5, ""])
 
     Boolean run_roundtrip    = true        # sampled-window CRAM-vs-BAM record comparison
     Boolean strict_roundtrip = true        # fail the task if the round trip disagrees
@@ -147,8 +156,8 @@ workflow BamToCram {
   call ConvertBamToCram {
     input:
       input_bam                = input_bam,
-      bam_index_path           = bam_index_path,
-      bam_md5_path             = bam_md5_path,
+      input_bam_index          = input_bam_index,
+      input_bam_md5            = input_bam_md5,
       output_basename          = output_basename,
       ref_fasta                = ref_fasta,
       ref_fasta_index          = ref_fasta_index,
@@ -212,8 +221,8 @@ workflow BamToCram {
 task ConvertBamToCram {
   input {
     File    input_bam
-    String  bam_index_path
-    String  bam_md5_path
+    File?   input_bam_index
+    File?   input_bam_md5
     String  output_basename
 
     File    ref_fasta
@@ -242,12 +251,51 @@ task ConvertBamToCram {
   command <<<
     set -euo pipefail
 
-    BAM="$(basename '~{input_bam}')"
+    # Cromwell/GCP materializes File inputs at <call_root>/<bucket>/<object prefix>/<name>
+    # - NOT in the task's working directory - so `basename "~{input_bam}"` is a dangling
+    # RELATIVE path on the cloud even though the identical line works locally, where the
+    # runner drops the file into cwd under its own name. That is what killed submission
+    # 58698ceb-782a-46a2-9384-89f063edb192 (rc 1, 0-byte stderr, stdout stopping after the
+    # samtools version): the first command touching "${BAM}" died under `set -euo pipefail`
+    # and its 2>/dev/null ate the message. Keep the localized path and link it into cwd,
+    # which is exactly what the reference block below already does.
+    BAMSRC='~{input_bam}'
+    BAM="$(basename "$BAMSRC")"
+    if [ ! -s "$BAMSRC" ]; then
+      echo "FATAL: input BAM is not localized at $BAMSRC" >&2
+      exit 1
+    fi
+    # Hardlink first (same filesystem as the reference block above, so a 22 GB BAM costs
+    # no second copy), symlink if that is refused, copy as a last resort. The existence
+    # guard keeps this correct for runners that already put the file in cwd under its own
+    # name (miniwdl does) - `ln -f` there would replace a real file with a link to itself.
+    if [ ! -e "./$BAM" ]; then
+      ln "$BAMSRC" "./$BAM" 2>/dev/null \
+        || ln -s "$BAMSRC" "./$BAM" 2>/dev/null \
+        || cp "$BAMSRC" "./$BAM"
+    fi
     OUT="~{output_basename}"
     CPU="~{cpu}"
 
+    # Optional inputs: interpolate the File? itself (never a pre-cast String) so Cromwell
+    # localizes it and hands back the in-container path. `default=""` is the Cromwell
+    # idiom for a File? in a command; miniwdl parses it with a deprecation notice only.
+    IDX='~{default="" input_bam_index}'
+    MD5IN='~{default="" input_bam_md5}'
+    # Loud, not silent, if that ever degrades to a cloud URI again - the exact failure
+    # this task already paid 47 minutes of coldline localization for.
+    for probe in "$IDX" "$MD5IN"; do
+      case "$probe" in
+        gs://*|https://*)
+          echo "FATAL: optional input arrived as an unlocalized cloud URI: $probe" >&2
+          exit 1 ;;
+      esac
+    done
+
     echo "== toolchain" | tee integrity.txt
-    samtools --version | head -2 | tee -a integrity.txt
+    # `| head -2` is a pipefail landmine (head closes the pipe -> SIGPIPE 141 on samtools);
+    # sed reads to EOF, so the pipeline cannot fail on a version banner.
+    samtools --version | sed -n '1,2p' | tee -a integrity.txt
 
     # ---- reference: prove which hg38 this is, before spending an hour on it --------
     # htslib only checks reference md5 when it decodes a slice, so a wrong FASTA can
@@ -260,8 +308,15 @@ task ConvertBamToCram {
     # CRAMs carry M5 and no UR at all; identity there is md5-only, as it is here).
     REFSRC="~{ref_fasta}"
     REFBASE="$(basename "$REFSRC")"
-    ln "$REFSRC" "./$REFBASE" 2>/dev/null || cp "$REFSRC" "./$REFBASE"
-    ln "~{ref_fasta_index}" "./${REFBASE}.fai" 2>/dev/null || cp "~{ref_fasta_index}" "./${REFBASE}.fai"
+    # Existence-guarded for the same reason as the BAM block: a runner that already put the
+    # file in cwd under its own name (miniwdl) makes a bare `ln` fail and the `cp` fallback
+    # then refuses to copy a file onto itself.
+    if [ ! -e "./$REFBASE" ]; then
+      ln "$REFSRC" "./$REFBASE" 2>/dev/null || cp "$REFSRC" "./$REFBASE"
+    fi
+    if [ ! -e "./${REFBASE}.fai" ]; then
+      ln "~{ref_fasta_index}" "./${REFBASE}.fai" 2>/dev/null || cp "~{ref_fasta_index}" "./${REFBASE}.fai"
+    fi
     REF="./$REFBASE"
     REF_MD5=$(md5sum "$REF" | awk '{print $1}')
     echo "reference = ${REFBASE} md5=${REF_MD5} size=$(wc -c < "$REF")" >> integrity.txt
@@ -274,8 +329,14 @@ task ConvertBamToCram {
       exit 1
     fi
     N_FA=$(cut -f1 "${REF}.fai" | sort -u | wc -l | tr -d ' ')
-    N_SQ=$(samtools view -H "${BAM}" 2>/dev/null | awk -F'\t' '$1=="@SQ"{n++}END{print n+0}')
+    # No 2>/dev/null here: a header read that fails must be visible, and under `set -e`
+    # a swallowed stderr is how a whole task dies with nothing to read afterwards.
+    N_SQ=$(samtools view -H "${BAM}" | awk -F'\t' '$1=="@SQ"{n++}END{print n+0}')
     echo "contigs: fasta=${N_FA} bam_@SQ=${N_SQ}" >> integrity.txt
+    if [ "${N_SQ}" -eq 0 ]; then
+      echo "FATAL: read 0 @SQ lines from ${BAM} (empty/truncated localization?)" >&2
+      exit 1
+    fi
     if [ "${N_FA}" != "${N_SQ}" ]; then
       echo "WARNING: reference contig count (${N_FA}) != BAM @SQ count (${N_SQ}) - CRAM encode will fail or skip contigs" >> integrity.txt
     fi
@@ -286,8 +347,8 @@ task ConvertBamToCram {
     # datarepo-row prefix, and it was built against BI's copy of the file, so verify
     # with idxstats before believing it; otherwise build our own.
     if [ ! -f "${BAM}.bai" ] && [ ! -f "${BAM}.csi" ]; then
-      if [ -n "~{bam_index_path}" ]; then
-        cp "~{bam_index_path}" "${BAM}.bai"
+      if [ -n "$IDX" ]; then
+        cp "$IDX" "${BAM}.bai"
         echo "copied supplied index -> ${BAM}.bai" >> integrity.txt
       fi
     fi
@@ -305,8 +366,8 @@ task ConvertBamToCram {
     # ---- md5 of the source BAM (TDD 2.H.4: integrity by size + MD5) ---------------
     md5sum "${BAM}" | awk '{print $1}' > input_bam_md5_computed.txt
     echo "input bam md5 = $(cat input_bam_md5_computed.txt)  size = $(wc -c < "${BAM}")" >> integrity.txt
-    if [ -n "~{bam_md5_path}" ]; then
-      SUPPLIED=$(awk 'NR==1{print $1}' "~{bam_md5_path}")
+    if [ -n "$MD5IN" ]; then
+      SUPPLIED=$(awk 'NR==1{print $1}' "$MD5IN")
       echo "supplied bam md5 = ${SUPPLIED}" >> integrity.txt
       if [ "${SUPPLIED}" = "$(cat input_bam_md5_computed.txt)" ]; then
         echo "INPUT_BAM_MD5=MATCH" >> integrity.txt
@@ -363,11 +424,15 @@ task ConvertBamToCram {
           if(sn!="")print sn,ln,m5}' > cram_sq.tsv
     N_SQ_M5=$(awk 'NF>=3 && $3!=""' cram_sq.tsv | wc -l | tr -d ' ')
     echo "cram @SQ=$(wc -l < cram_sq.tsv | tr -d ' ') with M5=${N_SQ_M5}" >> integrity.txt
+    # Array name `want`, NOT `exp`: `exp` is awk's builtin exponential function, and using
+    # it as an array name is invalid - the first time this block was ever executed (local
+    # replay, docs/progress/072) BSD awk died with "awk: illegal statement at source line 2".
+    # It had never run on Terra because the canary shipped without reference_m5_table.
     M5_TABLE="~{default="" reference_m5_table}"
     if [ -n "${M5_TABLE}" ]; then
       awk -F'\t' -v t="${M5_TABLE}" '
-        NR==FNR { if ($0 ~ /^#/) next; exp[$1]=$3; len[$1]=$2; n++; next }
-        { e = exp[$1]
+        NR==FNR { if ($0 ~ /^#/) next; want[$1]=$3; len[$1]=$2; n++; next }
+        { e = want[$1]
           if (e == "")      { absent++; if (absent<4) print "  not in table: " $1 > "/dev/stderr" }
           else if ($3 != e) { bad++;  printf "  %s expected=%s got=%s\n", $1, e, $3 > "/dev/stderr" }
           else              { ok++ }
@@ -395,7 +460,7 @@ task ConvertBamToCram {
       : > roundtrip.err
       samtools view -H "${OUT}.cram" 2>/dev/null \
         | awk -F'\t' '$1=="@SQ"{n=substr($2,4); l=substr($3,4); if (n ~ /^chr[0-9XY]+$/) print l"\t"n}' \
-        | sort -rn | head -n "~{roundtrip_contigs}" \
+        | sort -rn | sed -n "1,~{roundtrip_contigs}p" \
         | awk -F'\t' -v W=~{roundtrip_window_bp} -v K=~{roundtrip_windows_per_contig} \
             '{for(k=0;k<K;k++){s=int($1*(k+1)/(K+1)); print $2":"s"-"s+W}}' > windows.txt
 
@@ -414,6 +479,7 @@ task ConvertBamToCram {
         samtools view -T "${REF}" "${BAM}" "${W}" > a.sam 2>> roundtrip.err                || RCA=$?
         samtools view -T "${REF}" "${OUT}.cram" "${W}" > b.sam 2>> roundtrip.err           || RCB=$?
         NA=$(wc -l < a.sam | tr -d ' '); NB=$(wc -l < b.sam | tr -d ' ')
+        DERIVED=0; SOURCE_TAGS=0
         if cmp -s a.sam b.sam; then
           FULL=MATCH; CORE=MATCH; TAGS=MATCH
         else
@@ -424,16 +490,35 @@ task ConvertBamToCram {
           #     DRAGEN ran with generate-md-tags=false);
           #   - CRAM stores tags in its own order.
           # So: (core) the 11 alignment fields, sorted - a wrong reference changes SEQ/QUAL;
-          #      (tags) every tag VALUE in the window as a sorted field multiset, minus MD.
+          #      (tags) every tag VALUE in the window as a sorted field multiset, minus the
+          #              keys htslib derives from the reference itself.
+          # NM:i: belongs with MD:Z: here, and that is not a nicety: the delivered BAMs
+          # carry neither tag (generate-md-tags=false; Picard's MISSING_TAG_NM complaint in
+          # the TDD is the same absence), while CRAM decoding adds BOTH - measured locally
+          # as 11 SAM fields in / 13 out, core identical. Comparing them anyway made every
+          # window tags=MISMATCH, which strict_roundtrip=true then aborts the task over.
+          # Dropping them costs no signal: both are computed from SEQ against the
+          # reference, and a wrong reference shows up in the core comparison first.
+          #
+          # awk, not `cut -f12- | tr '\t' '\n'`: on a record with no optional fields at all
+          # (which is what a tagless source BAM gives), `cut -f12-` prints an EMPTY LINE on
+          # both BSD and GNU cut - measured locally, 6 blank lines for a 6-read window - so
+          # the two multisets differ by one blank per read and the gate reports MISMATCH on
+          # a conversion that is actually exact. awk over fields 12..NF has no such case.
           for f in a b; do
             cut -f1-11 $f.sam | LC_ALL=C sort > $f.core
-            { cut -f1-11 $f.sam; cut -f12- $f.sam | tr '\t' '\n' | grep -v '^MD:Z:' || true; } \
+            { cut -f1-11 $f.sam
+              awk -F'\t' '{for(i=12;i<=NF;i++) if ($i !~ /^MD:Z:/ && $i !~ /^NM:i:/) print $i}' $f.sam; } \
               | LC_ALL=C sort > $f.tags
           done
           if cmp -s a.core b.core; then CORE=MATCH; else CORE=MISMATCH; fi
           if cmp -s a.tags  b.tags;  then TAGS=MATCH;  else TAGS=MISMATCH;  fi
+          # Reported, never gated: the source's own tag count and what CRAM added back.
+          # On BI data expect source_tags=0 and cram_derived_tags ~= 2 reads x 2 tags.
+          SOURCE_TAGS=$(awk -F'\t' '{if(NF>11) n+=NF-11}END{print n+0}' a.sam)
+          DERIVED=$(awk -F'\t' '{for(i=12;i<=NF;i++) if ($i ~ /^MD:Z:/ || $i ~ /^NM:i:/) c++}END{print c+0}' b.sam)
         fi
-        echo "window ${W} bam_records=${NA} cram_records=${NB} bam_exit=${RCA} cram_exit=${RCB} full=${FULL} core=${CORE} tags=${TAGS}" >> roundtrip.txt
+        echo "window ${W} bam_records=${NA} cram_records=${NB} bam_exit=${RCA} cram_exit=${RCB} full=${FULL} core=${CORE} tags=${TAGS} source_tags=${SOURCE_TAGS} cram_derived_tags=${DERIVED}" >> roundtrip.txt
 
         # An empty window proves nothing, so it must not count as a pass.
         if [ "${CORE}" != "MATCH" ] || [ "${TAGS}" != "MATCH" ] || [ "${NA}" != "${NB}" ] \
