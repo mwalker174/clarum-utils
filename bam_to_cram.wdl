@@ -194,9 +194,12 @@ workflow BamToCram {
     File?   validation_report       = ValidateCram.report
   }
 
+  ## NOTE on the `meta` block: Terra's Cromwell parser rejects commas between entries
+  ## ("Expected rbrace, got ','" when the method is registered) - `meta` is not a WDL
+  ## expression map. Keep one entry per line, no trailing commas; miniwdl accepts that too.
   meta {
-    description: "BAM -> CRAM for the prospective somatic ES delivery (TDD 2.H.3 / 2.H.4): convert, index, md5, md5-check the source BAM, and prove the reference is the one DRAGEN used by comparing CRAM and BAM records over sampled windows.",
-    summary: "Convert an aligned BAM to CRAM with index, md5 and round-trip evidence",
+    description: "BAM -> CRAM for the prospective somatic ES delivery (TDD 2.H.3 / 2.H.4): convert, index, md5, md5-check the source BAM, and prove the reference is the one DRAGEN used by comparing CRAM and BAM records over sampled windows."
+    summary: "Convert an aligned BAM to CRAM with index, md5 and round-trip evidence"
     author: "CLARUM / Talkowski lab"
   }
   # No `capabilities:` block: the pointer used by mutect2_pon.wdl
