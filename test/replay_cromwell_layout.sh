@@ -84,11 +84,19 @@ REF_MD5=$($MD5 "$REF" | awk '{print $1}')
 
 # One read every 100 bp so both sampled windows are non-empty: the tested path needs reads
 # in the window, and case 4 needs to be able to make "too few tested windows" fail.
+#
+# The reads carry SEVEN synthetic tags each. Canary #2 measured the delivered BAM at 7.43 tag
+# fields per read (299,010 tags over 40,220 reads, docs/progress/073), while this fixture was
+# originally tagless - and a tagless fixture cannot fail the tag-multiset comparison, so the
+# one gate that the MD/NM exclusion protects was covered only on Terra. The tag NAMES here are
+# invented (plausible DRAGEN-ish flowtag shapes, not a claim about the delivered set); what is
+# being reproduced is the shape: a tag-rich source, one of whose tags (NM:i:) is also a key
+# htslib re-derives on decode, which the comparison must exclude by name on both sides.
 Q="$(printf 'I%.0s' $(seq 100))"
 {
   printf '@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:5000\n'
   for p in $(seq 200 100 4800); do
-    printf 'r%s\t99\tchr1\t%s\t60\t100M\t=\t%s\t300\t%s\t%s\n' \
+    printf 'r%s\t99\tchr1\t%s\t60\t100M\t=\t%s\t300\t%s\t%s\tBC:Z:ACTGACTG-1\tBZ:Z:AACC,GGTT,ACGT\tBI:i:1\tQX:i:99\tSM:i:1\tGP:i:100\tNM:i:0\n' \
       "$p" "$p" "$((p+300))" \
       "$(python3 -c "import random;random.seed($p);print(''.join(random.choice('ACGT') for _ in range(100)))")" \
       "$Q"
@@ -158,6 +166,10 @@ check "roundtrip.txt does not open with a stale ROUNDTRIP=SKIPPED line" \
   "$(head -1 "$CR/roundtrip.txt" | grep -q '^window '; echo $?)"
 check "integrity.txt separates tested / empty / failing windows" \
   "$(grep -q 'roundtrip: windows=2 tested=2 empty=0 failing=0' "$CR/integrity.txt"; echo $?)"
+check "a tag-rich source (7 tags/read as delivered) still compares with no tags=MISMATCH" \
+  "$(grep -q 'source_tags=[1-9][0-9]* cram_derived_tags=[1-9][0-9]*' "$CR/roundtrip.txt" && ! grep -q 'tags=MISMATCH' "$CR/roundtrip.txt"; echo $?)"
+check "CRAM decode re-added MD/NM on top of the source tags" \
+  "$(grep -q 'cram_derived_tags=[1-9][0-9]*' "$CR/roundtrip.txt"; echo $?)"
 check "roundtrip_identical output = true" \
   "$(grep -qx true "$CR/roundtrip_identical.txt"; echo $?)"
 echo "  per-window report:"; sed -n '2,$p' "$CR/roundtrip.txt" 2>/dev/null | sed 's/^/    /'
