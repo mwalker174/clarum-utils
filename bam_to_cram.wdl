@@ -89,10 +89,28 @@ version 1.0
 ##   must land in a CLARUM-owned bucket; write the paths back to the `sample` table.
 ## - One BAM is 20.4 GiB (400x exome), so expect ~60+ GiB of local disk per call.
 ##
-## Outputs (wire straight into a Terra `sample` table):
-##   output_cram, output_cram_index, output_cram_md5, output_cram_index_md5,
-##   integrity_report (md5s + sizes + record counts + ROUNDTRIP line),
-##   roundtrip_identical (Boolean), validation_report
+## Outputs: the deliverable, and deliberately nothing else
+## ------------------------------------------------------------
+##   output_cram, output_cram_index (.crai), output_cram_md5, output_cram_index_md5
+## That is the whole output contract, and it is small on purpose. Every check this task
+## performs (toolchain versions, reference md5, contig counts, source-BAM md5, record
+## counts, the @SQ M5 block, the round-trip verdict) is printed to **stdout**, which
+## Cromwell captures into the call's exec dir without being declared as an output. Two
+## lessons, each paid for with a whole conversion:
+##
+##   - A declared output that a gate can skip strands every output behind it: Cromwell
+##     walks a call's delocalization list in a hash order the WDL does not control and
+##     stops at the first missing *required* file. Submission 0c6ccba5 lost a CRAM that
+##     had been on disk for two hours because one report the strict gate had not reached
+##     sat earlier in that list.
+##   - Every derived non-File output is an expression Cromwell has to evaluate at that
+##     same moment. Submission cf4cb95f lost a second conversion to
+##     `Int cram_bytes = round(size(x, "Bytes"))` - **"Bytes" is not a unit Cromwell
+##     knows** (B/KB/MB/GB/KiB/MiB/GiB/... are), and `miniwdl check` accepts it happily.
+##     Fewer outputs, fewer ways to lose a good conversion.
+##
+## The offline join of the CRAM's own @SQ block against `data/qc-inputs/bi_gs_cram_sq_m5.tsv`
+## is `src/scripts/join_cram_sq_against_m5.py`; run it on the `cram_sq.tsv` in the exec dir.
 
 workflow BamToCram {
   input {
@@ -137,24 +155,13 @@ workflow BamToCram {
     # round-trip block), so this is what fails a run that never got to compare anything.
     Int     min_roundtrip_windows        = 8
 
-    Boolean run_validation = true          # Picard ValidateSamFile over the CRAM
-    Int     validation_mem_gb = 16
-    String  validation_ignore = "MISSING_TAG_NM"   # space-separated; WARP ignores this one too
-    Boolean skip_mate_validation = false   # WARP sets this only for outlier data
-
     # samtools 1.11 image WARP's ConvertToCram runs on (ships seq_cache_populate.pl).
     String  samtools_docker = "us.gcr.io/broad-gotc-prod/samtools:1.0.0-1.11-1624651616"
-    # Picard 2.26.10 = the version the delivered 620-sample gVCFs were produced with
-    # (methodConfig gatk/ReadBamHeader attrs), so these reports are comparable to the
-    # retrospective ones. WARP's ValidateSamFile task runs the same image.
-    String  picard_docker   = "us.gcr.io/broad-gotc-prod/picard-cloud:2.26.10"
 
     Int     cpu = 8                        # samtools -@ threads for -C compression
     Int     mem_gb = 12
     Int     additional_disk_gb = 40        # on top of ~2x BAM + reference
     Int     preemptible = 3                # a restart re-streams 20 GiB; raise to 0 if flaky
-
-    String  picard_extra_args = ""         # e.g. "IGNORE=MATERIAL_AND_NON_PRIMITIVE_SUPPORT"
   }
 
   call ConvertBamToCram {
@@ -180,23 +187,12 @@ workflow BamToCram {
       preemptible              = preemptible
   }
 
-  # `defined(...)` because ConvertBamToCram's outputs are optional (see its completion
-  # manifest): a call that died before converting must not launch Picard on a null CRAM.
-  if (run_validation && defined(ConvertBamToCram.output_cram)) {
-    call ValidateCram {
-      input:
-        cram            = select_first([ConvertBamToCram.output_cram]),
-        output_basename = output_basename,
-        ref_fasta       = ref_fasta,
-        ref_fasta_index = ref_fasta_index,
-        validation_mem_gb     = validation_mem_gb,
-        validation_ignore     = validation_ignore,
-        skip_mate_validation  = skip_mate_validation,
-        picard_docker     = picard_docker,
-        picard_extra_args = picard_extra_args,
-        preemptible       = preemptible
-    }
-  }
+  # One call, and one set of outputs. Picard ValidateSamFile used to hang off this as a
+  # second call; it is gone - it localized the reference and the CRAM again to produce a
+  # report nobody ships, and ERRORS on a CRAM whose source BAM carries no NM (which is
+  # every BAM here) would have failed workflows over evidence rather than deliverables.
+  # If it is ever wanted again it should be its own call, deliberately, not bolted onto
+  # the conversion.
 
   # Everything is optional at this boundary on purpose. Cromwell aborts a call's
   # delocalization list at the first missing REQUIRED file and skips everything behind it
@@ -204,30 +200,19 @@ workflow BamToCram {
   # therefore lost a CRAM that had already been converted and written, because one report
   # the strict gate had not reached sat earlier in the list. Completeness is enforced
   # inside the task (completion manifest) instead, where a missing artifact is a loud
-  # failure rather than a silent stranding. Nulls here mean "that evidence was not
-  # produced", which a caller must still check.
+  # failure rather than a silent stranding.
   output {
-    File?    output_cram             = ConvertBamToCram.output_cram
-    File?    output_cram_index       = ConvertBamToCram.output_cram_index
-    File?    output_cram_md5         = ConvertBamToCram.output_cram_md5
-    File?    output_cram_index_md5   = ConvertBamToCram.output_cram_index_md5
-    File?    integrity_report        = ConvertBamToCram.integrity_report
-    File?    roundtrip_report        = ConvertBamToCram.roundtrip_report
-    File?    reference_m5_check      = ConvertBamToCram.reference_m5_check
-    File?    reference_sq_table      = ConvertBamToCram.reference_sq_table
-    String   roundtrip_verdict       = ConvertBamToCram.roundtrip_verdict
-    Boolean  roundtrip_tested        = ConvertBamToCram.roundtrip_tested
-    Boolean  roundtrip_identical     = ConvertBamToCram.roundtrip_identical
-    File?    validation_report       = ValidateCram.report
-    File?    validation_log          = ValidateCram.log
-    Boolean? validation_passed       = ValidateCram.passed
+    File? output_cram           = ConvertBamToCram.output_cram
+    File? output_cram_index     = ConvertBamToCram.output_cram_index
+    File? output_cram_md5       = ConvertBamToCram.output_cram_md5
+    File? output_cram_index_md5 = ConvertBamToCram.output_cram_index_md5
   }
 
   ## NOTE on the `meta` block: Terra's Cromwell parser rejects commas between entries
   ## ("Expected rbrace, got ','" when the method is registered) - `meta` is not a WDL
   ## expression map. Keep one entry per line, no trailing commas; miniwdl accepts that too.
   meta {
-    description: "BAM -> CRAM for the prospective somatic ES delivery (TDD 2.H.3 / 2.H.4): convert, index, md5, md5-check the source BAM, and prove the reference is the one DRAGEN used by comparing CRAM and BAM records over sampled windows."
+    description: "BAM -> CRAM for the prospective somatic ES delivery (TDD 2.H.3 / 2.H.4): convert, index, md5, md5-check the source BAM, and prove the reference is the one DRAGEN used by comparing CRAM and BAM records over sampled windows. Outputs the CRAM, its index and their md5s; all QC evidence goes to stdout."
     summary: "Convert an aligned BAM to CRAM with index, md5 and round-trip evidence"
     author: "CLARUM / Talkowski lab"
   }
@@ -452,7 +437,7 @@ task ConvertBamToCram {
     M5_TABLE="~{default="" reference_m5_table}"
     if [ -n "${M5_TABLE}" ]; then
       awk -F'\t' -v t="${M5_TABLE}" '
-        NR==FNR { if ($0 ~ /^#/) next; want[$1]=$3; len[$1]=$2; n++; next }
+        NR==FNR { if ($0 ~ /^#/) next; want[$1]=tolower($3); len[$1]=$2; n++; next }
         { e = want[$1]
           if (e == "")      { absent++; if (absent<4) print "  not in table: " $1 > "/dev/stderr" }
           else if ($3 != e) { bad++;  printf "  %s expected=%s got=%s\n", $1, e, $3 > "/dev/stderr" }
@@ -544,7 +529,11 @@ task ConvertBamToCram {
           if cmp -s a.core b.core; then CORE=MATCH; else CORE=MISMATCH; fi
           if cmp -s a.tags  b.tags;  then TAGS=MATCH;  else TAGS=MISMATCH;  fi
           # Reported, never gated: the source's own tag count and what CRAM added back.
-          # On BI data expect source_tags=0 and cram_derived_tags ~= 2 reads x 2 tags.
+          # Measured on the delivered ACH0024_LM17 BAM over 40,220 reads: 299,010 tag
+          # fields = 7.43 per read (DRAGEN writes a tag-rich BAM), and CRAM decode adds
+          # exactly 2.00 per read - MD:Z: + NM:i:. An earlier note here said "expect
+          # source_tags=0", which was the tagless local fixture talking, not BI data
+          # (docs/progress/073); the fixture now carries 7 tags/read to match.
           SOURCE_TAGS=$(awk -F'\t' '{if(NF>11) n+=NF-11}END{print n+0}' a.sam)
           DERIVED=$(awk -F'\t' '{for(i=12;i<=NF;i++) if ($i ~ /^MD:Z:/ || $i ~ /^NM:i:/) c++}END{print c+0}' b.sam)
         fi
@@ -611,12 +600,23 @@ task ConvertBamToCram {
       fi
     fi
 
+    # ---- the evidence goes to stdout, not into the output contract -----------------
+    # Cromwell captures stdout + stderr + rc into the call's exec dir whether or not they
+    # are declared, so printing costs nothing and cannot strand a deliverable.
+    echo "---- integrity.txt ----"; cat integrity.txt
+    if [ -s roundtrip.txt ]; then echo "---- roundtrip.txt ----"; cat roundtrip.txt; fi
+    if [ -s m5_check.txt ]; then echo "---- m5_check.txt ----"; cat m5_check.txt; fi
+    echo "---- CRAM @SQ block (input to src/scripts/join_cram_sq_against_m5.py) ----"
+    echo "cram_sq.tsv rows=$(wc -l < cram_sq.tsv | tr -d ' ')"
+
     # ---- completion manifest -----------------------------------------------------------
     # Every declared output of this task is File? (see the workflow output block), which
     # removes the stranding hazard but also removes Cromwell's own guarantee that a
     # successful call produced them. This manifest is that guarantee: a call that exits 0
     # has produced every artifact the deliverable needs, and a call that is missing one
-    # says which, loudly, while uploading whatever does exist.
+    # says which, loudly, while uploading whatever does exist. The evidence files are no
+    # longer outputs, but they stay in the manifest for the other half of the job: their
+    # presence proves the checks actually ran before this task called itself done.
     MANIFEST="${OUT}.cram ${OUT}.cram.crai ${OUT}.cram.md5 ${OUT}.cram.crai.md5 integrity.txt bam_idxstats.txt input_bam_md5_computed.txt cram_sq.tsv roundtrip_identical.txt"
     MISSING=""
     for f in ${MANIFEST}; do
@@ -636,116 +636,19 @@ task ConvertBamToCram {
     preemptible: preemptible
   }
 
-  # All optional: see the completion manifest above and the workflow output comment.
-  # `bam_idxstats` stays here as an output too - it is what a window landing off-target
-  # gets checked against, so it is part of the evidence a reviewer needs.
+  # The deliverable, and nothing else: see the header's "Outputs" section. Four Files, all
+  # optional so that a gate failing later cannot strand the CRAM, with completeness
+  # enforced by the manifest above. No Int/String derived outputs - `size(x, "Bytes")` on
+  # submission cf4cb95f failed output evaluation for the whole call, and a `read_string`
+  # in an output block is a file dependency waiting to be skipped.
   output {
     File? output_cram           = "~{output_basename}.cram"
     File? output_cram_index     = "~{output_basename}.cram.crai"
     File? output_cram_md5       = "~{output_basename}.cram.md5"
     File? output_cram_index_md5 = "~{output_basename}.cram.crai.md5"
-
-    File? integrity_report      = "integrity.txt"
-    File? roundtrip_report      = "roundtrip.txt"
-    File? reference_m5_check    = "m5_check.txt"
-    File? reference_sq_table    = "cram_sq.tsv"
-    File? input_bam_md5_computed = "input_bam_md5_computed.txt"
-    File? bam_idxstats          = "bam_idxstats.txt"
-    # Three states, kept distinct without a null literal (see the shell comment above):
-    #   roundtrip_tested=false                -> the comparison never ran
-    #   roundtrip_tested=true  identical=false -> tested and disagreed
-    #   roundtrip_tested=true  identical=true  -> tested and every window matched
-    String  roundtrip_verdict   = read_string("roundtrip_identical.txt")
-    Boolean roundtrip_tested    = roundtrip_verdict == "true" || roundtrip_verdict == "false"
-    Boolean roundtrip_identical = roundtrip_verdict == "true"
-
-    Int cram_bytes  = round(size(output_cram, "Bytes"))
-    Int crai_bytes  = round(size(output_cram_index, "Bytes"))
   }
 
   meta {
-    description: "samtools view -C + index + md5 + source-BAM md5 check + sampled-window round-trip against the source BAM."
-  }
-}
-
-task ValidateCram {
-  input {
-    File    cram
-    String  output_basename
-    File    ref_fasta
-    File    ref_fasta_index
-    Int     validation_mem_gb
-    String  validation_ignore
-    Boolean skip_mate_validation
-    String  picard_docker
-    String  picard_extra_args
-    Int     preemptible
-  }
-
-  Int disk_gb        = ceil(size(cram, "GB") + size(ref_fasta, "GB") + size(ref_fasta_index, "GB") + 30)
-  Int machine_mem_mb = validation_mem_gb * 1024
-  Int java_xmx_mb    = machine_mem_mb - 500
-  Int java_xms_mb    = machine_mem_mb - 1000
-
-  command <<<
-    set -euo pipefail
-
-    IGNORES=""
-    for tok in ~{validation_ignore}; do IGNORES="${IGNORES} IGNORE=${tok}"; done
-
-    # Same invocation WARP's QC.ValidateSamFile uses (tasks/broad/QC.wdl): Picard,
-    # REFERENCE_SEQUENCE only - no dict needed - MODE=VERBOSE, IS_BISULFITE_SEQUENCED
-    # =false. MISSING_TAG_NM is expected for DRAGEN output and WARP ignores it too.
-    # Mate validation is the expensive part on a 400x exome; WARP enables it unless
-    # the sample is outlier data, so we default to the same.
-    REPORT="~{output_basename}.cram.validation_report"
-    LOG="~{output_basename}.cram.validation.log"
-    # Picard exits non-zero when it counts ERRORS, which is information, not a reason to
-    # throw away the conversion: capture the rc instead of letting `set -e` kill a call
-    # that has already produced a valid CRAM (and, as in ConvertBamToCram's manifest
-    # comment, a task that dies with a declared-but-absent output strands the other
-    # outputs behind it in Cromwell's delocalization list). The rc travels with the
-    # report as `passed`, and reading the report stays a human judgement.
-    RC=0
-    java -Xms~{java_xms_mb}m -Xmx~{java_xmx_mb}m -jar /usr/picard/picard.jar \
-      ValidateSamFile \
-      INPUT="~{cram}" \
-      OUTPUT="${REPORT}" \
-      REFERENCE_SEQUENCE="~{ref_fasta}" \
-      MAX_OUTPUT=100000 \
-      MODE=VERBOSE \
-      SKIP_MATE_VALIDATION=~{skip_mate_validation} \
-      IS_BISULFITE_SEQUENCED=false \
-      ${IGNORES} ~{picard_extra_args} \
-      2> "${LOG}" || RC=$?
-    echo "VALIDATE_RC=${RC}" > validate_rc.txt
-    echo "ValidateSamFile rc=${RC}" >> "${LOG}"
-    # Both declared outputs must exist whatever Picard did: it writes no report at all
-    # when it dies on its own (no sequence dictionary, unreadable reference, ...).
-    if [ ! -s "${REPORT}" ]; then
-      {
-        echo "ValidateSamFile produced no report (rc=${RC}). Log tail:"
-        tail -40 "${LOG}" 2>/dev/null || true
-      } > "${REPORT}"
-    fi
-  >>>
-
-  runtime {
-    docker: picard_docker
-    memory: machine_mem_mb + " MB"
-    cpu: 2
-    disks: "local-disk " + disk_gb + " HDD"
-    preemptible: preemptible
-  }
-
-  output {
-    File    report  = "~{output_basename}.cram.validation_report"
-    File    log     = "~{output_basename}.cram.validation.log"
-    String exit_note = read_string("validate_rc.txt")
-    Boolean passed   = exit_note == "VALIDATE_RC=0"
-  }
-
-  meta {
-    description: "Picard ValidateSamFile over the converted CRAM (MODE=VERBOSE, MISSING_TAG_NM ignored by default, mate validation on unless skipped)."
+    description: "samtools view -C + index + md5 + source-BAM md5 check + sampled-window round-trip against the source BAM; QC evidence on stdout."
   }
 }

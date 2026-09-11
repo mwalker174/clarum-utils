@@ -233,6 +233,34 @@ check "manifest block extracted from the rendered command" "$([ -s "$WORK/manife
     "$(grep -q 'task finished without producing: A.cram.crai.md5' "$WORK/man.err"; echo $?)"
 )
 
+echo "== 8. the output contract, and the units Cromwell can parse (static) =="
+#
+# Both of these are lints, not behaviours, and they exist because two canaries died in
+# output evaluation *after* a successful two-hour conversion. miniwdl accepts everything
+# here: `size(x, "Bytes")` parsed and checked clean on submission cf4cb95f, and Cromwell
+# answered `Bad output 'ConvertBamToCram.cram_bytes': Unit with suffix Bytes was not
+# found.` Cromwell's vocabulary is B/KB/MB/GB/TB/PB + KiB/MiB/GiB/TiB/PiB - "Bytes" is not
+# in it. Same for the output list: every extra declared output is another expression that
+# has to evaluate, and another required file that can strand the CRAM behind it (0c6ccba5).
+TASK_OUT=$(awk '/^task ConvertBamToCram/,0' "$WDL" | awk '/^  output \{/,/^  \}/')
+check "task declares exactly the 4 deliverables as outputs" \
+  "$([ "$(printf '%s\n' "$TASK_OUT" | grep -c 'File?[[:space:]]*output_cram')" -eq 4 ]; echo $?)"
+check "...and nothing else (no reports, no derived Int/String outputs)" \
+  "$([ "$(printf '%s\n' "$TASK_OUT" | grep -cE '^[[:space:]]*(Int|String|Boolean|Float|File[^?])')" -eq 0 ]; echo $?)"
+check "no read_string() in an output expression (a skipped write would fail output eval)" \
+  "$(! grep -vE '^[[:space:]]*#' "$WDL" | grep -qE '=\s*read_string\s*\('; echo $?)"
+check "Picard ValidateCram is gone, not merely unused" \
+  "$(! grep -qE 'call ValidateCram|^task ValidateCram' "$WDL"; echo $?)"
+BAD_UNITS=$(grep -vE '^[[:space:]]*(#|##)' "$WDL" | grep -E 'size\(|memory:' | grep -oE '"[A-Za-z]{1,6}"' | tr -d '"' | sort -u \
+  | grep -vE '^(B|KB|MB|GB|TB|PB|EB|KiB|MiB|GiB|TiB|PiB|EiB)$' || true)
+if [ -n "$BAD_UNITS" ]; then echo "    Cromwell cannot parse these unit strings: $BAD_UNITS"; fi
+check "every size()/memory unit is one Cromwell knows (cf4cb95f died on 'Bytes')" \
+  "$([ -z "$BAD_UNITS" ]; echo $?)"
+check "QC evidence is printed to stdout, so trimming outputs loses nothing" \
+  "$(grep -q 'cat integrity.txt' "$WDL" && grep -q 'cat roundtrip.txt' "$WDL"; echo $?)"
+check "the round-trip gate is still inside the command (trim outputs, not checks)" \
+  "$(grep -q 'ROUNDTRIP=PASS' "$WDL" && grep -q 'min_roundtrip_windows' "$WDL"; echo $?)"
+
 echo
 if [ "$fails" -ne 0 ]; then echo "REPLAY FAILED ($fails check(s))"; exit 1; fi
 echo "REPLAY OK - every gate in bam_to_cram.wdl exercised in a Cromwell-shaped tree"
