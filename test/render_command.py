@@ -30,6 +30,15 @@ def main():
     ap.add_argument("--task", default="ConvertBamToCram")
     ap.add_argument("--root", required=True, help="emulated Cromwell call root")
     ap.add_argument("--ref-md5", required=True)
+    ap.add_argument(
+        "--set",
+        dest="overrides",
+        action="append",
+        default=[],
+        metavar="INPUT=VALUE",
+        help="override a rendered input (e.g. --set run_roundtrip=false); the key must be "
+        "one this task's command actually interpolates",
+    )
     args = ap.parse_args()
 
     cr = args.root.rstrip("/")
@@ -48,6 +57,9 @@ def main():
         "roundtrip_window_bp": "500",
         "roundtrip_windows_per_contig": "2",
         "roundtrip_contigs": "12",
+        # The fixture is a single 5 kb contig, so only K=2 windows exist at all; the
+        # production default (8 tested windows) is exercised by overriding this.
+        "min_roundtrip_windows": "2",
         # Revisions before the fix addressed the optional inputs through workflow-level
         # Strings, which hold the raw cloud URI (that is the bug, not the harness). Mapping
         # them keeps historical revisions replayable: git show HEAD~1:bam_to_cram.wdl.
@@ -57,6 +69,15 @@ def main():
 
     text = open(args.wdl).read()
     body = command_block(text, args.task)
+
+    for kv in args.overrides:
+        key, sep, val = kv.partition("=")
+        if not sep or key.strip() not in values:
+            raise SystemExit(
+                "--set %r: not an input this command interpolates (known: %s)"
+                % (kv, ", ".join(sorted(values)))
+            )
+        values[key.strip()] = val
 
     def sub(mo):
         key = mo.group(1).strip()

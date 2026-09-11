@@ -18,6 +18,16 @@
 #   3. the reference-M5 join, which used `exp` (awk's builtin exponential) as an array name,
 #      so the block died with an awk syntax error the first time it executed.
 #
+# The first Terra canary that got through it (submission 0c6ccba5-1045-4479-be9e-0b75548801f7,
+# 2 h 01 m, docs/progress/073) then exposed three more, which cases 4-7 below guard:
+#   4. an empty sampled window counted as a round-trip FAILURE, so one off-target window on
+#      capture data aborted a clean conversion (23 of 24 windows matched);
+#   5. a strict-gate `exit 1` that skipped writing an output file, which made Cromwell stop
+#      delocalizing at the first missing required output and throw away the CRAM behind it -
+#      outputs are optional now, and the completion manifest is what enforces completeness;
+#   6. roundtrip.txt beginning with a stale "ROUNDTRIP=SKIPPED" line even when the round trip
+#      ran, i.e. a deliverable report whose first line contradicted its last.
+#
 # Usage:  test/replay_cromwell_layout.sh [--wdl path/to/bam_to_cram.wdl]
 # Requires: samtools (+ python3, awk, sed). Reference-free: the M5 table case is synthesized.
 set -uo pipefail
@@ -72,8 +82,8 @@ PY
 samtools faidx "$REF"
 REF_MD5=$($MD5 "$REF" | awk '{print $1}')
 
-# One read every 100 bp so that the sampled windows are non-empty: an empty window is a
-# failed test, not a passed one, and the task says so.
+# One read every 100 bp so both sampled windows are non-empty: the tested path needs reads
+# in the window, and case 4 needs to be able to make "too few tested windows" fail.
 Q="$(printf 'I%.0s' $(seq 100))"
 {
   printf '@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:5000\n'
@@ -104,6 +114,14 @@ PY
 
 python3 "$HERE/render_command.py" "$WDL" "$WORK/task.sh" --root "$CR" --ref-md5 "$REF_MD5" \
   || { echo "render failed - a placeholder is not covered by the harness" >&2; exit 1; }
+# Same command block, different inputs: too few tested windows for the coverage floor, the
+# same condition with strict_roundtrip=false, and the round trip switched off altogether.
+python3 "$HERE/render_command.py" "$WDL" "$WORK/task_min8.sh" --root "$CR" --ref-md5 "$REF_MD5" \
+  --set min_roundtrip_windows=8 || exit 1
+python3 "$HERE/render_command.py" "$WDL" "$WORK/task_min8_lenient.sh" --root "$CR" --ref-md5 "$REF_MD5" \
+  --set min_roundtrip_windows=8 --set strict_roundtrip=false || exit 1
+python3 "$HERE/render_command.py" "$WDL" "$WORK/task_nort.sh" --root "$CR" --ref-md5 "$REF_MD5" \
+  --set run_roundtrip=false || exit 1
 
 fails=0
 wipe() {
@@ -112,10 +130,10 @@ wipe() {
          roundtrip_identical.txt windows.txt m5_check.txt bam_idxstats.txt \
          input_bam_md5_computed.txt A.cram A.cram.crai A.cram.md5 A.cram.crai.md5 cram_sq.tsv
 }
-run() {  # run <m5-table-or-empty> -> sets RC, writes $WORK/run.out / $WORK/run.err
-  local m5="$1"
+run() {  # run <m5-table-or-empty> [rendered-script] -> sets RC, writes $WORK/run.out / $WORK/run.err
+  local m5="$1" src="${2:-$WORK/task.sh}"
   wipe
-  sed "s|M5_TABLE=\"\"|M5_TABLE=\"$m5\"|" "$WORK/task.sh" > "$WORK/step.sh"
+  sed "s|M5_TABLE=\"\"|M5_TABLE=\"$m5\"|" "$src" > "$WORK/step.sh"
   PATH="$BIN:$PATH" bash "$WORK/step.sh" > "$WORK/run.out" 2> "$WORK/run.err"
   RC=$?
 }
@@ -135,7 +153,11 @@ check "BAM/CRAM record counts agree" \
   "$(grep -q 'RECORD_COUNT=MATCH' "$CR/integrity.txt"; echo $?)"
 check "CRAM indexed (.crai) and non-empty" "$([ -s "$CR/A.cram.crai" ]; echo $?)"
 check "round-trip gate PASSED on sampled windows (tags=MISMATCH bug)" \
-  "$(grep -q 'ROUNDTRIP=PASS' "$CR/roundtrip.txt"; echo $?)"
+  "$(grep -q 'ROUNDTRIP=PASS(2 tested of 2 sampled, 0 empty)' "$CR/roundtrip.txt"; echo $?)"
+check "roundtrip.txt does not open with a stale ROUNDTRIP=SKIPPED line" \
+  "$(head -1 "$CR/roundtrip.txt" | grep -q '^window '; echo $?)"
+check "integrity.txt separates tested / empty / failing windows" \
+  "$(grep -q 'roundtrip: windows=2 tested=2 empty=0 failing=0' "$CR/integrity.txt"; echo $?)"
 check "roundtrip_identical output = true" \
   "$(grep -qx true "$CR/roundtrip_identical.txt"; echo $?)"
 echo "  per-window report:"; sed -n '2,$p' "$CR/roundtrip.txt" 2>/dev/null | sed 's/^/    /'
@@ -151,6 +173,53 @@ run "$WORK/m5_bad.tsv"
 check "task rc!=0" "$([ "$RC" -ne 0 ]; echo $?)"
 check "stderr carries the FATAL, not an empty file" \
   "$(grep -q 'FATAL: CRAM @SQ M5 disagrees' "$WORK/run.err"; echo $?)"
+
+echo "== 4. too few tested windows (min_roundtrip_windows=8, fixture has 2) =="
+run "" "$WORK/task_min8.sh"
+check "task rc!=0 - a round trip that compared too little is not a pass" "$([ "$RC" -ne 0 ]; echo $?)"
+check "verdict says INSUFFICIENT_COVERAGE, with the counts" \
+  "$(grep -q 'ROUNDTRIP=INSUFFICIENT_COVERAGE (tested=2 < min_roundtrip_windows=8, sampled=2, empty=0)' "$CR/roundtrip.txt"; echo $?)"
+check "roundtrip_identical.txt still written (false) before the strict exit" \
+  "$(grep -qx false "$CR/roundtrip_identical.txt"; echo $?)"
+check "the CRAM and its index survived to be delocalized" \
+  "$([ -s "$CR/A.cram" ] && [ -s "$CR/A.cram.crai" ] && [ -s "$CR/integrity.txt" ]; echo $?)"
+check "stderr names the verdict, not a bare 'wrong reference?' guess" \
+  "$(grep -q 'FATAL: CRAM does not read back as the source BAM over 2 tested window' "$WORK/run.err"; echo $?)"
+
+echo "== 5. same condition, strict_roundtrip=false -> report it, do not abort =="
+run "" "$WORK/task_min8_lenient.sh"
+check "task rc=0 (non-strict records the disagreement instead of killing the deliverable)" "$([ "$RC" -eq 0 ]; echo $?)"
+check "verdict still in roundtrip.txt" \
+  "$(grep -q 'ROUNDTRIP=INSUFFICIENT_COVERAGE' "$CR/roundtrip.txt"; echo $?)"
+check "roundtrip_identical=false is the machine-readable signal" \
+  "$(grep -qx false "$CR/roundtrip_identical.txt"; echo $?)"
+
+echo "== 6. run_roundtrip=false -> skipped is stated, and is not 'identical' =="
+run "" "$WORK/task_nort.sh"
+check "task rc=0" "$([ "$RC" -eq 0 ]; echo $?)"
+check "roundtrip.txt says SKIPPED" \
+  "$(grep -q 'ROUNDTRIP=SKIPPED' "$CR/roundtrip.txt"; echo $?)"
+check "roundtrip_identical.txt says not_tested, so 'not tested' is neither true nor false" \
+  "$(grep -qx not_tested "$CR/roundtrip_identical.txt"; echo $?)"
+check "completion manifest still satisfied with the round trip off" \
+  "$([ -s "$CR/A.cram" ] && [ -s "$CR/cram_sq.tsv" ]; echo $?)"
+
+echo "== 7. completion manifest alone: teeth, and no false alarm =="
+run ""
+awk '/# ---- completion manifest/,0' "$WORK/task.sh" > "$WORK/manifest.sh"
+check "manifest block extracted from the rendered command" "$([ -s "$WORK/manifest.sh" ]; echo $?)"
+(
+  cd "$CR" || exit 73
+  OUT=A PATH="$BIN:$PATH" bash "$WORK/manifest.sh" > "$WORK/man.out" 2> "$WORK/man.err"
+  MRC=$?
+  check "complete artifact set -> manifest silent and rc=0" "$([ "$MRC" -eq 0 ]; echo $?)"
+  rm -f A.cram.crai.md5
+  OUT=A PATH="$BIN:$PATH" bash "$WORK/manifest.sh" > "$WORK/man.out" 2> "$WORK/man.err"
+  MRC=$?
+  check "one artifact removed -> rc!=0" "$([ "$MRC" -ne 0 ]; echo $?)"
+  check "and it names the missing file" \
+    "$(grep -q 'task finished without producing: A.cram.crai.md5' "$WORK/man.err"; echo $?)"
+)
 
 echo
 if [ "$fails" -ne 0 ]; then echo "REPLAY FAILED ($fails check(s))"; exit 1; fi

@@ -132,6 +132,10 @@ workflow BamToCram {
     Int     roundtrip_window_bp          = 20000
     Int     roundtrip_windows_per_contig = 2
     Int     roundtrip_contigs            = 12   # longest N primary contigs
+    # How many sampled windows must actually contain reads for the comparison to mean
+    # anything. Off-target windows on capture data are skipped, not failed (see the
+    # round-trip block), so this is what fails a run that never got to compare anything.
+    Int     min_roundtrip_windows        = 8
 
     Boolean run_validation = true          # Picard ValidateSamFile over the CRAM
     Int     validation_mem_gb = 16
@@ -168,6 +172,7 @@ workflow BamToCram {
       roundtrip_window_bp      = roundtrip_window_bp,
       roundtrip_windows_per_contig = roundtrip_windows_per_contig,
       roundtrip_contigs        = roundtrip_contigs,
+      min_roundtrip_windows    = min_roundtrip_windows,
       samtools_docker          = samtools_docker,
       cpu                      = cpu,
       mem_gb                   = mem_gb,
@@ -175,10 +180,12 @@ workflow BamToCram {
       preemptible              = preemptible
   }
 
-  if (run_validation) {
+  # `defined(...)` because ConvertBamToCram's outputs are optional (see its completion
+  # manifest): a call that died before converting must not launch Picard on a null CRAM.
+  if (run_validation && defined(ConvertBamToCram.output_cram)) {
     call ValidateCram {
       input:
-        cram            = ConvertBamToCram.output_cram,
+        cram            = select_first([ConvertBamToCram.output_cram]),
         output_basename = output_basename,
         ref_fasta       = ref_fasta,
         ref_fasta_index = ref_fasta_index,
@@ -191,16 +198,29 @@ workflow BamToCram {
     }
   }
 
+  # Everything is optional at this boundary on purpose. Cromwell aborts a call's
+  # delocalization list at the first missing REQUIRED file and skips everything behind it
+  # in an order the WDL does not control; submission 0c6ccba5-1045-4479-be9e-0b75548801f7
+  # therefore lost a CRAM that had already been converted and written, because one report
+  # the strict gate had not reached sat earlier in the list. Completeness is enforced
+  # inside the task (completion manifest) instead, where a missing artifact is a loud
+  # failure rather than a silent stranding. Nulls here mean "that evidence was not
+  # produced", which a caller must still check.
   output {
-    File    output_cram             = ConvertBamToCram.output_cram
-    File    output_cram_index       = ConvertBamToCram.output_cram_index
-    File    output_cram_md5         = ConvertBamToCram.output_cram_md5
-    File    output_cram_index_md5   = ConvertBamToCram.output_cram_index_md5
-    File    integrity_report        = ConvertBamToCram.integrity_report
-    File?   roundtrip_report        = ConvertBamToCram.roundtrip_report
-    File?   reference_m5_check      = ConvertBamToCram.reference_m5_check
-    Boolean roundtrip_identical     = ConvertBamToCram.roundtrip_identical
-    File?   validation_report       = ValidateCram.report
+    File?    output_cram             = ConvertBamToCram.output_cram
+    File?    output_cram_index       = ConvertBamToCram.output_cram_index
+    File?    output_cram_md5         = ConvertBamToCram.output_cram_md5
+    File?    output_cram_index_md5   = ConvertBamToCram.output_cram_index_md5
+    File?    integrity_report        = ConvertBamToCram.integrity_report
+    File?    roundtrip_report        = ConvertBamToCram.roundtrip_report
+    File?    reference_m5_check      = ConvertBamToCram.reference_m5_check
+    File?    reference_sq_table      = ConvertBamToCram.reference_sq_table
+    String   roundtrip_verdict       = ConvertBamToCram.roundtrip_verdict
+    Boolean  roundtrip_tested        = ConvertBamToCram.roundtrip_tested
+    Boolean  roundtrip_identical     = ConvertBamToCram.roundtrip_identical
+    File?    validation_report       = ValidateCram.report
+    File?    validation_log          = ValidateCram.log
+    Boolean? validation_passed       = ValidateCram.passed
   }
 
   ## NOTE on the `meta` block: Terra's Cromwell parser rejects commas between entries
@@ -235,6 +255,7 @@ task ConvertBamToCram {
     Int     roundtrip_window_bp
     Int     roundtrip_windows_per_contig
     Int     roundtrip_contigs
+    Int     min_roundtrip_windows
 
     String  samtools_docker
     Int     cpu
@@ -454,9 +475,19 @@ task ConvertBamToCram {
     # Sampled windows keep it cheap (~1-2 min). Restricted to primary contigs because
     # HLA contig NAMES contain ':' and are therefore hostile in a region string; the
     # HLA/ALT/decoy block is covered offline by src/scripts/verify_reference_against_bam.py.
-    echo "ROUNDTRIP=SKIPPED" > roundtrip.txt
+    RT_N=0
+    RT_TESTED=0
+    RT_EMPTY=0
     RT_FAIL=0
-    if [ "~{run_roundtrip}" = "true" ]; then
+    if [ "~{run_roundtrip}" != "true" ]; then
+      echo "ROUNDTRIP=SKIPPED (run_roundtrip=false)" > roundtrip.txt
+      # Three states, never two: "not tested" must not arrive as true or false. Written as
+      # text and decoded in the output block as TWO booleans (roundtrip_tested /
+      # roundtrip_identical), because a portable WDL 1.0 null literal - `None`, or the
+      # `read_string?` optional-function form - is precisely what Cromwell and miniwdl
+      # parse differently, and a deliverable flag must not depend on that.
+      echo "not_tested" > roundtrip_identical.txt
+    else
       : > roundtrip.err
       samtools view -H "${OUT}.cram" 2>/dev/null \
         | awk -F'\t' '$1=="@SQ"{n=substr($2,4); l=substr($3,4); if (n ~ /^chr[0-9XY]+$/) print l"\t"n}' \
@@ -464,7 +495,6 @@ task ConvertBamToCram {
         | awk -F'\t' -v W=~{roundtrip_window_bp} -v K=~{roundtrip_windows_per_contig} \
             '{for(k=0;k<K;k++){s=int($1*(k+1)/(K+1)); print $2":"s"-"s+W}}' > windows.txt
 
-      RT_N=0
       while read -r W; do
         RT_N=$((RT_N + 1))
         # Region goes as a POSITIONAL argument. `samtools view -r` is --read-group, not
@@ -520,39 +550,82 @@ task ConvertBamToCram {
         fi
         echo "window ${W} bam_records=${NA} cram_records=${NB} bam_exit=${RCA} cram_exit=${RCB} full=${FULL} core=${CORE} tags=${TAGS} source_tags=${SOURCE_TAGS} cram_derived_tags=${DERIVED}" >> roundtrip.txt
 
-        # An empty window proves nothing, so it must not count as a pass.
-        if [ "${CORE}" != "MATCH" ] || [ "${TAGS}" != "MATCH" ] || [ "${NA}" != "${NB}" ] \
-           || [ "${NA}" -eq 0 ] || [ "${RCA}" -ne 0 ] || [ "${RCB}" -ne 0 ]; then
-          RT_FAIL=$((RT_FAIL + 1))
+        # An empty window is neither a pass nor a failure: it is the absence of a test.
+        # On capture data a midpoint/quarter-point window lands off-target routinely -
+        # canary 0c6ccba5 drew 1 empty window in 24 on ACH0024_LM17 while the other 23
+        # came back core=MATCH tags=MATCH, and the strict gate aborted a 2 h conversion
+        # over that empty window. Counted separately; min_roundtrip_windows below is what
+        # fails a run that could not sample enough reads to compare anything.
+        if [ "${NA}" -eq 0 ] && [ "${NB}" -eq 0 ] && [ "${RCA}" -eq 0 ] && [ "${RCB}" -eq 0 ]; then
+          RT_EMPTY=$((RT_EMPTY + 1))
+        else
+          RT_TESTED=$((RT_TESTED + 1))
+          if [ "${CORE}" != "MATCH" ] || [ "${TAGS}" != "MATCH" ] || [ "${NA}" != "${NB}" ] \
+             || [ "${RCA}" -ne 0 ] || [ "${RCB}" -ne 0 ]; then
+            RT_FAIL=$((RT_FAIL + 1))
+          fi
         fi
         rm -f a.sam b.sam a.core b.core a.tags b.tags
       done < windows.txt
-      echo "roundtrip: windows=${RT_N} failing=${RT_FAIL}" >> integrity.txt
+      echo "roundtrip: windows=${RT_N} tested=${RT_TESTED} empty=${RT_EMPTY} failing=${RT_FAIL}" >> integrity.txt
       if [ -s roundtrip.err ]; then
         echo "roundtrip stderr (first 20 lines):" >> integrity.txt
         head -20 roundtrip.err >> integrity.txt
       fi
 
-      # An empty window list means the @SQ parse found no primary contigs - that is a
-      # failed test, not a passed one, so it must not read back as roundtrip_identical.
+      # One verdict, written to both reports, and worded for what was actually measured.
+      # NO_WINDOWS means the @SQ parse found no primary contigs; INSUFFICIENT_COVERAGE
+      # means the windows held too few reads. Both are inconclusive, therefore failures -
+      # but they are reported as themselves, not as "the CRAM disagrees".
+      RT_BAD=0
       if [ "${RT_N}" -eq 0 ]; then
-        echo "ROUNDTRIP=NO_WINDOWS (no chr[0-9XY] contigs in the header?)" >> integrity.txt
-        RT_FAIL=1
-      fi
-      if [ "${RT_FAIL}" -gt 0 ]; then
-        cat roundtrip.txt >> integrity.txt
-        echo "ROUNDTRIP=FAIL(${RT_FAIL}/${RT_N})" >> roundtrip.txt
-        if [ "~{strict_roundtrip}" = "true" ]; then
-          echo "FATAL: CRAM does not read back as the source BAM - wrong reference?" >&2
-          exit 1
-        fi
+        RT_VERDICT="ROUNDTRIP=NO_WINDOWS (no chr[0-9XY] contigs in the CRAM header?)"
+        RT_BAD=1
+      elif [ "${RT_TESTED}" -lt "~{min_roundtrip_windows}" ]; then
+        RT_VERDICT="ROUNDTRIP=INSUFFICIENT_COVERAGE (tested=${RT_TESTED} < min_roundtrip_windows=~{min_roundtrip_windows}, sampled=${RT_N}, empty=${RT_EMPTY})"
+        RT_BAD=1
+      elif [ "${RT_FAIL}" -gt 0 ]; then
+        RT_VERDICT="ROUNDTRIP=FAIL(${RT_FAIL}/${RT_TESTED} tested, ${RT_EMPTY} empty)"
+        RT_BAD=1
       else
-        echo "ROUNDTRIP=PASS(${RT_N} windows)" >> roundtrip.txt
+        RT_VERDICT="ROUNDTRIP=PASS(${RT_TESTED} tested of ${RT_N} sampled, ${RT_EMPTY} empty)"
+      fi
+      echo "${RT_VERDICT}" >> roundtrip.txt
+      echo "${RT_VERDICT}" >> integrity.txt
+
+      # The boolean is written BEFORE any strict exit. On submission 0c6ccba5 the
+      # `exit 1` below skipped this file, Cromwell stopped delocalizing at the first
+      # missing required output, and the converted CRAM plus integrity.txt - which had
+      # existed since the first second of the call - were never uploaded.
+      if [ "${RT_BAD}" -eq 0 ]; then echo "true" > roundtrip_identical.txt; else echo "false" > roundtrip_identical.txt; fi
+
+      if [ "${RT_BAD}" -eq 1 ] && [ "~{strict_roundtrip}" = "true" ]; then
+        # Deliberately NOT "wrong reference?": a CRAM decodes against whatever reference
+        # it is handed and reproduces what it stored even if that reference is the wrong
+        # build, so this gate detects a reference that changed between encode and decode,
+        # not a wrong build. A wrong build is the @SQ M5 gate above (or the offline join
+        # of cram_sq.tsv against docs/RESOURCES.md's M5 table) that detects that.
+        echo "FATAL: CRAM does not read back as the source BAM over ${RT_TESTED} tested window(s) - see roundtrip.txt" >&2
+        grep -v 'core=MATCH tags=MATCH' roundtrip.txt >&2 || true
+        exit 1
       fi
     fi
 
-    # roundtrip_identical: false only on a real, tested disagreement.
-    if [ "${RT_FAIL}" -eq 0 ]; then echo "true" > roundtrip_identical.txt; else echo "false" > roundtrip_identical.txt; fi
+    # ---- completion manifest -----------------------------------------------------------
+    # Every declared output of this task is File? (see the workflow output block), which
+    # removes the stranding hazard but also removes Cromwell's own guarantee that a
+    # successful call produced them. This manifest is that guarantee: a call that exits 0
+    # has produced every artifact the deliverable needs, and a call that is missing one
+    # says which, loudly, while uploading whatever does exist.
+    MANIFEST="${OUT}.cram ${OUT}.cram.crai ${OUT}.cram.md5 ${OUT}.cram.crai.md5 integrity.txt bam_idxstats.txt input_bam_md5_computed.txt cram_sq.tsv roundtrip_identical.txt"
+    MISSING=""
+    for f in ${MANIFEST}; do
+      [ -s "${f}" ] || MISSING="${MISSING} ${f}"
+    done
+    if [ -n "${MISSING}" ]; then
+      echo "FATAL: task finished without producing:${MISSING}" >&2
+      exit 1
+    fi
   >>>
 
   runtime {
@@ -563,18 +636,28 @@ task ConvertBamToCram {
     preemptible: preemptible
   }
 
+  # All optional: see the completion manifest above and the workflow output comment.
+  # `bam_idxstats` stays here as an output too - it is what a window landing off-target
+  # gets checked against, so it is part of the evidence a reviewer needs.
   output {
-    File output_cram           = "~{output_basename}.cram"
-    File output_cram_index     = "~{output_basename}.cram.crai"
-    File output_cram_md5       = "~{output_basename}.cram.md5"
-    File output_cram_index_md5 = "~{output_basename}.cram.crai.md5"
+    File? output_cram           = "~{output_basename}.cram"
+    File? output_cram_index     = "~{output_basename}.cram.crai"
+    File? output_cram_md5       = "~{output_basename}.cram.md5"
+    File? output_cram_index_md5 = "~{output_basename}.cram.crai.md5"
 
-    File integrity_report      = "integrity.txt"
-    File? roundtrip_report     = "roundtrip.txt"
-    File? reference_m5_check   = "m5_check.txt"
-    File input_bam_md5_computed = "input_bam_md5_computed.txt"
-    File bam_idxstats          = "bam_idxstats.txt"
-    Boolean roundtrip_identical = read_string("roundtrip_identical.txt") == "true"
+    File? integrity_report      = "integrity.txt"
+    File? roundtrip_report      = "roundtrip.txt"
+    File? reference_m5_check    = "m5_check.txt"
+    File? reference_sq_table    = "cram_sq.tsv"
+    File? input_bam_md5_computed = "input_bam_md5_computed.txt"
+    File? bam_idxstats          = "bam_idxstats.txt"
+    # Three states, kept distinct without a null literal (see the shell comment above):
+    #   roundtrip_tested=false                -> the comparison never ran
+    #   roundtrip_tested=true  identical=false -> tested and disagreed
+    #   roundtrip_tested=true  identical=true  -> tested and every window matched
+    String  roundtrip_verdict   = read_string("roundtrip_identical.txt")
+    Boolean roundtrip_tested    = roundtrip_verdict == "true" || roundtrip_verdict == "false"
+    Boolean roundtrip_identical = roundtrip_verdict == "true"
 
     Int cram_bytes  = round(size(output_cram, "Bytes"))
     Int crai_bytes  = round(size(output_cram_index, "Bytes"))
@@ -615,17 +698,36 @@ task ValidateCram {
     # =false. MISSING_TAG_NM is expected for DRAGEN output and WARP ignores it too.
     # Mate validation is the expensive part on a 400x exome; WARP enables it unless
     # the sample is outlier data, so we default to the same.
+    REPORT="~{output_basename}.cram.validation_report"
+    LOG="~{output_basename}.cram.validation.log"
+    # Picard exits non-zero when it counts ERRORS, which is information, not a reason to
+    # throw away the conversion: capture the rc instead of letting `set -e` kill a call
+    # that has already produced a valid CRAM (and, as in ConvertBamToCram's manifest
+    # comment, a task that dies with a declared-but-absent output strands the other
+    # outputs behind it in Cromwell's delocalization list). The rc travels with the
+    # report as `passed`, and reading the report stays a human judgement.
+    RC=0
     java -Xms~{java_xms_mb}m -Xmx~{java_xmx_mb}m -jar /usr/picard/picard.jar \
       ValidateSamFile \
       INPUT="~{cram}" \
-      OUTPUT="~{output_basename}.cram.validation_report" \
+      OUTPUT="${REPORT}" \
       REFERENCE_SEQUENCE="~{ref_fasta}" \
       MAX_OUTPUT=100000 \
       MODE=VERBOSE \
       SKIP_MATE_VALIDATION=~{skip_mate_validation} \
       IS_BISULFITE_SEQUENCED=false \
       ${IGNORES} ~{picard_extra_args} \
-      2> "~{output_basename}.cram.validation.log"
+      2> "${LOG}" || RC=$?
+    echo "VALIDATE_RC=${RC}" > validate_rc.txt
+    echo "ValidateSamFile rc=${RC}" >> "${LOG}"
+    # Both declared outputs must exist whatever Picard did: it writes no report at all
+    # when it dies on its own (no sequence dictionary, unreadable reference, ...).
+    if [ ! -s "${REPORT}" ]; then
+      {
+        echo "ValidateSamFile produced no report (rc=${RC}). Log tail:"
+        tail -40 "${LOG}" 2>/dev/null || true
+      } > "${REPORT}"
+    fi
   >>>
 
   runtime {
@@ -637,8 +739,10 @@ task ValidateCram {
   }
 
   output {
-    File report = "~{output_basename}.cram.validation_report"
-    File log    = "~{output_basename}.cram.validation.log"
+    File    report  = "~{output_basename}.cram.validation_report"
+    File    log     = "~{output_basename}.cram.validation.log"
+    String exit_note = read_string("validate_rc.txt")
+    Boolean passed   = exit_note == "VALIDATE_RC=0"
   }
 
   meta {
