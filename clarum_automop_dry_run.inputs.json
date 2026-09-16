@@ -1,0 +1,10 @@
+{
+ "workspace_namespace": "talkowski-arpa-clarum",
+ "workspace_name": "CLARUM_8623_TALK_RETRO_GA4K_WES_CNV",
+ "user": "markw@broadinstitute.org",
+ "dry_run": true,
+ "confirm_delete": false,
+ "prefix": "clarum_automop_dry_run",
+ "fiss_version": "0.16.39",
+ "python_image": "python:3.11-slim"
+}
