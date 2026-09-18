@@ -118,8 +118,13 @@ task groupByContig {
 task annotateContig {
   input {
     String contig
-    # Tab-joined shard URIs for this contig, in coordinate order, as emitted by groupByContig.
+    # Pipe-joined shard URIs for this contig, in coordinate order, as emitted by groupByContig.
+    # Pipe, not tab: this field rides inside a TSV row that Cromwell read_tsv()s, and a tab in it
+    # would silently shift every column after it.
     String shard_blob
+    # read_tsv hands back Strings and WDL will not coerce String->Int at a call site, so the group
+    # index travels as a String and is used verbatim in the output names.
+    String group_index
     File annotate_script
     File gather_contig_script
     String gnomad_dataset = "joint"
@@ -135,9 +140,8 @@ task annotateContig {
   }
 
   File shards_file = write_lines([shard_blob])
-  String out_vcf = "~{cohort_prefix}.~{contig}.g41.vcf.gz"
-  String out_summary = "~{cohort_prefix}.~{contig}.gnomad_join_summary.json"
-  String out_manifest = "~{cohort_prefix}.~{contig}.metrics_manifest.tsv"
+  String out_vcf = "~{cohort_prefix}.~{contig}.g~{group_index}.g41.vcf.gz"
+  String out_summary = "~{cohort_prefix}.~{contig}.g~{group_index}.gnomad_join_summary.json"
 
   command <<<
     set -euo pipefail
@@ -154,7 +158,7 @@ task annotateContig {
 
     # One --vcf per shard. The URIs come from a file, not from an interpolated command line, so a
     # large group cannot turn into an E2BIG discovered only at scale.
-    tr '\t' '\n' < '~{shards_file}' | sed '/^$/d' > shards.txt
+    tr '|' '\n' < '~{shards_file}' | sed '/^$/d' > shards.txt
     vcf_args=""
     while read -r uri; do
       vcf_args="$vcf_args --vcf $uri"
@@ -185,7 +189,7 @@ task annotateContig {
       --dataset '~{gnomad_dataset}' \
       --maf '~{maf}'
 
-    ls -l '~{out_vcf}' '~{out_summary}' '~{out_manifest}'
+    ls -l '~{out_vcf}' '~{out_summary}' out/metrics_manifest.tsv
   >>>
 
   runtime {
@@ -200,7 +204,9 @@ task annotateContig {
   output {
     File annotated_vcf = out_vcf
     File summary_json = out_summary
-    File metrics_manifest = out_manifest
+    # The join script writes its manifest under --out-dir with a fixed name, once per task run, so
+    # the path is literal rather than derived.
+    File metrics_manifest = "out/metrics_manifest.tsv"
   }
 
   meta {
@@ -301,6 +307,7 @@ workflow moc12AnnotateMetrics {
     call annotateContig {
       input:
         contig          = grp[0],
+        group_index     = grp[1],
         shard_blob      = grp[2],
         annotate_script = annotate_script,
         gather_contig_script = gather_contig_script,
@@ -316,13 +323,14 @@ workflow moc12AnnotateMetrics {
 
   Array[File] per_contig_vcfs = annotateContig.annotated_vcf
   Array[File] per_contig_summaries = annotateContig.summary_json
+  File gather_contig_manifest = annotateContig.metrics_manifest[0]
 
   if (gather) {
     call gatherDeliverable {
       input:
         contig_vcfs      = per_contig_vcfs,
         contig_summaries = per_contig_summaries,
-        metrics_manifest = annotateContig.metrics_manifest[0],
+        metrics_manifest = gather_contig_manifest,
         gather_deliverable_script = gather_deliverable_script,
         deliverable_name = deliverable_name,
         annotate_docker  = annotate_docker,
