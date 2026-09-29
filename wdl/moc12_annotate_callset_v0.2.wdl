@@ -56,6 +56,12 @@ workflow moc12AnnotateCallset {
     Int part_preemptible_tries = 2
     Int gather_cpu = 8
     Boolean gather = true
+    # WGS: stream gnomAD over each part's own span once, keep only the INFO fields the join reads,
+    # and join against local disk. Remote joining a genome-density part ran >10 h 44 m on shard 22
+    # without finishing (docs/progress/097 §4.7). Off by default: WES/mosaic are certified without it.
+    Boolean prefetch_gnomad = false
+    File? prefetch_script
+    Int part_disk_extra_gb = 0
   }
 
   scatter (i in range(length(part_vcfs))) {
@@ -77,7 +83,10 @@ workflow moc12AnnotateCallset {
         docker = docker,
         cpu = part_cpu,
         memory_gb = part_memory_gb,
-        preemptible_tries = part_preemptible_tries
+        preemptible_tries = part_preemptible_tries,
+        prefetch_gnomad = prefetch_gnomad,
+        prefetch_script = prefetch_script,
+        disk_extra_gb = part_disk_extra_gb
     }
   }
 
@@ -135,10 +144,14 @@ task annotatePart {
     Int cpu
     Int memory_gb
     Int preemptible_tries
+    Boolean prefetch_gnomad = false
+    File? prefetch_script
+    Int disk_extra_gb = 0
   }
 
-  # input + three rewrites of it (dropped, +g41, +clinvar) must fit at once
-  Int disk_gb = ceil(size(vcf, "GB") * 5 + size(clinvar_vcf, "GB") + 20)
+  # input + three rewrites of it (dropped, +g41, +clinvar) must fit at once; a slim mirror adds
+  # disk_extra_gb
+  Int disk_gb = ceil(size(vcf, "GB") * 5 + size(clinvar_vcf, "GB") + 20) + disk_extra_gb
   String out_vcf = "~{part_name}.annotated.vcf.gz"
   String out_gnomad = "~{part_name}.gnomad_join_summary.json"
   String out_clinvar = "~{part_name}.clinvar_join_summary.json"
@@ -190,14 +203,25 @@ print(json.load(urllib.request.urlopen(r, timeout=30))['access_token'])
       cp '~{vcf}' part.vcf.gz
     fi
 
-    # 2. gnomAD v4.1
+    # 2. gnomAD v4.1 -- remote, or from a slim local mirror of this part's span
     rc=0
+    mirror_args=""
+    if [ "~{prefetch_gnomad}" = "true" ]; then
+      cp '~{default="" prefetch_script}' ./prefetch_gnomad_span.py
+      python3 ./prefetch_gnomad_span.py --vcf part.vcf.gz --out-dir mirror \
+        --annotator ./annotate_gnomad_v41.py --dataset '~{gnomad_dataset}' --spine '~{spine}' \
+        --jobs 3 --threads ~{cpu} || rc=$?
+      echo "prefetch_rc=$rc"
+      if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+      du -sh mirror
+      mirror_args="--gnomad-root mirror --covered-bed mirror/covered_regions.bed"
+    fi
     python3 ./annotate_gnomad_v41.py --vcf part.vcf.gz \
       --dataset '~{gnomad_dataset}' --spine '~{spine}' --maf '~{maf}' --window '~{window}' \
-      --out-dir g41 || rc=$?
+      $mirror_args --out-dir g41 || rc=$?
     echo "gnomad_rc=$rc"
     if [ "$rc" -ne 0 ]; then exit "$rc"; fi
-    rm -f part.vcf.gz
+    rm -rf part.vcf.gz mirror
 
     # 3. ClinVar (ours)
     blank_args=""
