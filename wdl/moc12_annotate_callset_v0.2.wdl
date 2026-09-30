@@ -62,6 +62,12 @@ workflow moc12AnnotateCallset {
     Boolean prefetch_gnomad = false
     File? prefetch_script
     Int part_disk_extra_gb = 0
+    # Preferred WGS route (owner ruling 2026-09-29: Hail is the default at scale): build the per-part
+    # mirror from gnomAD's own Hail Tables -- field pruning + interval filtering instead of decoding
+    # full VCF records -- then run the same certified join against it. Wins over prefetch_gnomad.
+    Boolean hail_mirror = false
+    File? hail_mirror_script
+    String hail_docker = "us.gcr.io/talkowski-sv-gnomad/shineren:hail"
   }
 
   scatter (i in range(length(part_vcfs))) {
@@ -86,7 +92,10 @@ workflow moc12AnnotateCallset {
         preemptible_tries = part_preemptible_tries,
         prefetch_gnomad = prefetch_gnomad,
         prefetch_script = prefetch_script,
-        disk_extra_gb = part_disk_extra_gb
+        disk_extra_gb = part_disk_extra_gb,
+        hail_mirror = hail_mirror,
+        hail_mirror_script = hail_mirror_script,
+        hail_docker = hail_docker
     }
   }
 
@@ -147,7 +156,11 @@ task annotatePart {
     Boolean prefetch_gnomad = false
     File? prefetch_script
     Int disk_extra_gb = 0
+    Boolean hail_mirror = false
+    File? hail_mirror_script
+    String hail_docker = "us.gcr.io/talkowski-sv-gnomad/shineren:hail"
   }
+  Int spark_driver_gb = floor(memory_gb * 0.8)
 
   # input + three rewrites of it (dropped, +g41, +clinvar) must fit at once; a slim mirror adds
   # disk_extra_gb
@@ -158,9 +171,14 @@ task annotatePart {
 
   command <<<
     set -euo pipefail
-    apt-get update -qq
-    apt-get install -y -qq --no-install-recommends libcurl4 ca-certificates bcftools tabix
-    pip install --no-cache-dir -q pysam==0.24.0
+    # Both images get the same toolset; the Hail image may already carry some of it. Probe with
+    # `command -v` into a variable, never `cmd | grep -q` under pipefail (snapshot-2 lesson).
+    have_bcf=$(command -v bcftools || true); have_tabix=$(command -v tabix || true)
+    if [ -z "$have_bcf" ] || [ -z "$have_tabix" ]; then
+      apt-get update -qq
+      apt-get install -y -qq --no-install-recommends libcurl4 ca-certificates bcftools tabix
+    fi
+    python3 -c "import pysam" || pip install --no-cache-dir -q pysam==0.24.0
 
     if [ -z "${GCS_OAUTH_TOKEN:-}" ]; then
       # python3, not curl: the python:3.12-slim image ships no curl binary (v0.1 canary, rc 127)
@@ -206,7 +224,18 @@ print(json.load(urllib.request.urlopen(r, timeout=30))['access_token'])
     # 2. gnomAD v4.1 -- remote, or from a slim local mirror of this part's span
     rc=0
     mirror_args=""
-    if [ "~{prefetch_gnomad}" = "true" ]; then
+    if [ "~{hail_mirror}" = "true" ]; then
+      cp '~{default="" hail_mirror_script}' ./hail_gnomad_mirror.py
+      mkdir -p hail_tmp
+      python3 ./hail_gnomad_mirror.py --vcf part.vcf.gz --out-dir mirror \
+        --annotator ./annotate_gnomad_v41.py --dataset '~{gnomad_dataset}' --spine '~{spine}' \
+        --cores ~{cpu} --driver-memory ~{spark_driver_gb}g --tmp-dir hail_tmp || rc=$?
+      echo "hail_mirror_rc=$rc"
+      if [ "$rc" -ne 0 ]; then exit "$rc"; fi
+      rm -rf hail_tmp
+      du -sh mirror
+      mirror_args="--gnomad-root mirror --covered-bed mirror/covered_regions.bed"
+    elif [ "~{prefetch_gnomad}" = "true" ]; then
       cp '~{default="" prefetch_script}' ./prefetch_gnomad_span.py
       python3 ./prefetch_gnomad_span.py --vcf part.vcf.gz --out-dir mirror \
         --annotator ./annotate_gnomad_v41.py --dataset '~{gnomad_dataset}' --spine '~{spine}' \
@@ -245,7 +274,7 @@ print(json.load(urllib.request.urlopen(r, timeout=30))['access_token'])
   >>>
 
   runtime {
-    docker: docker
+    docker: if hail_mirror then hail_docker else docker
     cpu: cpu
     memory: "~{memory_gb} GB"
     disks: "local-disk ~{disk_gb} HDD"
