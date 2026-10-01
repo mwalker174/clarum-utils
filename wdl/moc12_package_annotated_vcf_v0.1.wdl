@@ -33,6 +33,10 @@ workflow moc12PackageAnnotatedVcf {
     String callset
     Array[String] drop_info = ["g41_vep_consequence"]
     String code_rev
+    # the same attributes as vcf / source_acceptance, bound as Strings so the gs:// URIs reach the
+    # acceptance record -- a File input only exists in the task as a localized path
+    String source_vcf_uri
+    String source_acceptance_uri
     String docker = "python:3.12-slim"
     Int cpu = 8
     Int memory_gb = 16
@@ -47,6 +51,8 @@ workflow moc12PackageAnnotatedVcf {
       callset = callset,
       drop_info = drop_info,
       code_rev = code_rev,
+      source_vcf_uri = source_vcf_uri,
+      source_acceptance_uri = source_acceptance_uri,
       docker = docker,
       cpu = cpu,
       memory_gb = memory_gb
@@ -74,6 +80,8 @@ task packageVcf {
     String callset
     Array[String] drop_info
     String code_rev
+    String source_vcf_uri
+    String source_acceptance_uri
     String docker
     Int cpu
     Int memory_gb
@@ -99,7 +107,8 @@ task packageVcf {
     rc=0
     python3 ./package_annotated_vcf.py --callset '~{callset}' --vcf '~{vcf}' \
       --source-acceptance source_acceptance.json $drop_args \
-      --out-dir pkg --code-rev '~{code_rev}' --threads ~{cpu} || rc=$?
+      --out-dir pkg --code-rev '~{code_rev}' --threads ~{cpu} \
+      --record-source-vcf '~{source_vcf_uri}' --record-source-acceptance '~{source_acceptance_uri}' || rc=$?
     echo "package_rc=$rc"
     if [ "$rc" -ne 0 ]; then exit "$rc"; fi
     ls -l pkg
