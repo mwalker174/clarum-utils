@@ -74,17 +74,22 @@ task groupByContig {
     pip install --no-cache-dir pysam==0.24.0
 
     if [ -z "${GCS_OAUTH_TOKEN:-}" ]; then
-      minted="$(curl -fsS -H 'Metadata-Flavor: Google' \
-        'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token')"
-      GCS_OAUTH_TOKEN="$(printf '%s' "$minted" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
+      # python3, not curl: the python:3.12-slim image ships NO curl binary, and installing
+      # `libcurl4` above provides the LIBRARY that pysam's htslib links -- not the command. The
+      # canary died here with `line 36: curl: command not found` (rc 127). python3 is guaranteed
+      # present in a python image, so minting through urllib removes the dependency entirely.
+      GCS_OAUTH_TOKEN="$(python3 -c "
+import json, urllib.request
+r = urllib.request.Request(
+    'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+    headers={'Metadata-Flavor': 'Google'})
+print(json.load(urllib.request.urlopen(r, timeout=30))['access_token'])
+")"
       export GCS_OAUTH_TOKEN
     fi
 
     python3 '~{group_script}' '~{shards_in}' '~{max_shards_per_group}' > groups.tsv
     wc -l < groups.tsv | tr -d ' ' | sed 's/^/groups=/'
-
-    cat > /dev/null <<'UNUSED'
-    UNUSED
   >>>
 
   runtime {
@@ -92,7 +97,15 @@ task groupByContig {
     cpu: 1
     memory: "4 GB"
     disks: "local-disk 50 HDD"
-    preemptible: 1
+    # preemptible 0, and this is a MEASURED decision, not caution. Canary attempt 2 lost BOTH
+    # groupByContig attempts to Spot preemption: Cromwell reported "The job was stopped before the
+    # command finished", rc was null, and stdout/stderr were entirely empty because a preempted VM
+    # never flushes. CLAUDE.md records that GCP Batch has NO on-demand fallback -- a retry goes
+    # straight back onto Spot -- so `preemptible: 1` on a short task is two coin flips, not a
+    # safety net. This task runs in under a minute; on-demand costs cents and removes the failure
+    # mode. (It also tests the inference in CLAUDE.md that a runtime-level `preemptible: 0` is the
+    # right lever, which had never been exercised here.)
+    preemptible: 0
     maxRetries: 1
   }
 
@@ -126,8 +139,16 @@ task annotateContig {
     # index travels as a String and is used verbatim in the output names.
     String group_index
     File annotate_script
+    # annotate_gnomad_v41.py imports `provenance` to stamp what produced each output. In the repo it
+    # resolves via ../lib; in a task container only the files we localize exist, so without this the
+    # import fails softly and the DELIVERABLE SHIPS WITH NO STAMP -- the exact gap the stamp was
+    # added to close.
+    File provenance_script
     File gather_contig_script
     String gnomad_dataset = "joint"
+    # Owner ruled 2026-09-21: plain AF, max across gnomAD ancestry groups. Passed EXPLICITLY rather
+    # than left to the script default, so a deliverable records the choice instead of inheriting it.
+    String spine = "af_grpmax"
     Float maf = 0.01
     Int window = 100000
     Int max_records = 0
@@ -136,6 +157,8 @@ task annotateContig {
     Int cpu_cores = 2
     Int memory_gb = 8
     Int disk_gb = 200
+    # annotateContig is the long task where Spot genuinely saves money, so it keeps its tries --
+    # but the canary runs it at 0 to prove the pipeline before optimising the bill.
     Int preemptible_tries = 2
   }
 
@@ -150,9 +173,17 @@ task annotateContig {
     pip install --no-cache-dir pysam==0.24.0
 
     if [ -z "${GCS_OAUTH_TOKEN:-}" ]; then
-      minted="$(curl -fsS -H 'Metadata-Flavor: Google' \
-        'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token')"
-      GCS_OAUTH_TOKEN="$(printf '%s' "$minted" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
+      # python3, not curl: the python:3.12-slim image ships NO curl binary, and installing
+      # `libcurl4` above provides the LIBRARY that pysam's htslib links -- not the command. The
+      # canary died here with `line 36: curl: command not found` (rc 127). python3 is guaranteed
+      # present in a python image, so minting through urllib removes the dependency entirely.
+      GCS_OAUTH_TOKEN="$(python3 -c "
+import json, urllib.request
+r = urllib.request.Request(
+    'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+    headers={'Metadata-Flavor': 'Google'})
+print(json.load(urllib.request.urlopen(r, timeout=30))['access_token'])
+")"
       export GCS_OAUTH_TOKEN
     fi
 
@@ -166,11 +197,18 @@ task annotateContig {
     echo "shards_in_group=$(wc -l < shards.txt | tr -d ' ')"
 
     mkdir -p out
+    # Both modules into the working directory: Python puts the script's own directory on sys.path,
+    # and Cromwell localizes each File input to a different mirror path, so co-locating is what
+    # makes `import provenance` resolve.
+    cp '~{annotate_script}' ./annotate_gnomad_v41.py
+    cp '~{provenance_script}' ./provenance.py
+
     # `|| rc=$?` keeps a nonzero tool exit as data instead of an unannotated abort, and leaves stderr
     # intact for the platform log.
     rc=0
-    python3 '~{annotate_script}' $vcf_args \
+    python3 ./annotate_gnomad_v41.py $vcf_args \
       --dataset '~{gnomad_dataset}' \
+      --spine '~{spine}' \
       --maf '~{maf}' \
       --window '~{window}' \
       --max-records '~{max_records}' \
@@ -259,7 +297,8 @@ task gatherDeliverable {
     cpu: 2
     memory: "~{memory_gb} GB"
     disks: "local-disk ~{disk_gb} HDD"
-    preemptible: 2
+    # same reasoning as groupByContig: a short gather is not worth a preemption coin flip
+    preemptible: 0
     maxRetries: 1
   }
 
@@ -280,11 +319,15 @@ workflow moc12AnnotateMetrics {
   input {
     Array[String] callset_shard_uris
     File annotate_script
+    File provenance_script
     File group_script
     File gather_contig_script
     File gather_deliverable_script
     String cohort_prefix = "clarum"
     String gnomad_dataset = "joint"
+    # Owner ruled 2026-09-21: plain AF, max across gnomAD ancestry groups. Passed EXPLICITLY rather
+    # than left to the script default, so a deliverable records the choice instead of inheriting it.
+    String spine = "af_grpmax"
     Float maf = 0.01
     Int window = 100000
     Int max_shards_per_group = 40
@@ -310,6 +353,7 @@ workflow moc12AnnotateMetrics {
         group_index     = grp[1],
         shard_blob      = grp[2],
         annotate_script = annotate_script,
+      provenance_script = provenance_script,
         gather_contig_script = gather_contig_script,
         gnomad_dataset  = gnomad_dataset,
         maf             = maf,
